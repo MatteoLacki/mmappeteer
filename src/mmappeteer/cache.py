@@ -9,12 +9,19 @@ from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
-from mmappet import DatasetWriter, open_dataset_dct
 
 SCHEMA_VERSION = 2
 INTENSITY_COLUMN = "predicted_intensity"
 ANNOTATION_COLUMN = "annotation_id"
 MAX_ANNOTATIONS = np.iinfo(np.uint16).max + 1
+
+
+def _load_mmappet():
+    """Import the storage backend only when cache storage is accessed."""
+
+    import mmappet
+
+    return mmappet
 
 
 class CacheError(RuntimeError):
@@ -299,7 +306,7 @@ class PredictionCache:
             connection.close()
 
         try:
-            with DatasetWriter.new(
+            with _load_mmappet().DatasetWriter.new(
                 dataset_path,
                 predicted_intensity=np.float32,
                 annotation_id=np.uint16,
@@ -457,7 +464,9 @@ class PredictionCache:
                         )
 
                     if len(keys):
-                        with DatasetWriter(self.dataset_path, append_ok=True) as writer:
+                        with _load_mmappet().DatasetWriter(
+                            self.dataset_path, append_ok=True
+                        ) as writer:
                             storage_start = len(writer)
                             writer.append(
                                 predicted_intensity=(predictions.predicted_intensities),
@@ -512,7 +521,7 @@ class PredictionCache:
                 ends[position] = end
                 found[position] = True
 
-        storage = open_dataset_dct(self.dataset_path)
+        storage = _load_mmappet().open_dataset_dct(self.dataset_path)
         return LookupResult(
             predicted_intensities=storage[INTENSITY_COLUMN],
             annotation_ids=storage[ANNOTATION_COLUMN],
@@ -524,7 +533,7 @@ class PredictionCache:
     def validate(self) -> None:
         """Check schema versions, annotation numbering, and stored ranges."""
 
-        storage = open_dataset_dct(self.dataset_path)
+        storage = _load_mmappet().open_dataset_dct(self.dataset_path)
         if set(storage) != {INTENSITY_COLUMN, ANNOTATION_COLUMN}:
             raise CacheValidationError(f"Unexpected mmappet columns: {list(storage)}")
         if storage[INTENSITY_COLUMN].dtype != np.dtype(np.float32):
@@ -611,7 +620,9 @@ class PredictionCache:
                 raise CacheValidationError(f"Overlapping cache ranges found: {overlap}")
 
     def _storage_length(self) -> int:
-        return len(open_dataset_dct(self.dataset_path)[INTENSITY_COLUMN])
+        return len(
+            _load_mmappet().open_dataset_dct(self.dataset_path)[INTENSITY_COLUMN]
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)

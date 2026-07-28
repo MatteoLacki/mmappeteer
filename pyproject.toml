@@ -12,7 +12,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "mmappet>=0.2.0",
+    "mmappet>=0.1.1",
     "numpy",
 ]
 

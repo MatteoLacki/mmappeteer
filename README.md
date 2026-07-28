@@ -6,8 +6,8 @@
 - `mmappet` stores growing, mmap-backed NumPy columns.
 
 The canonical cache maps `(charge, collision_energy, sequence)` to two aligned
-vectors: predicted intensities (`float32`) and annotation IDs (`uint16`). There
-is no pandas dependency or DataFrame API.
+vectors: predicted intensities (`float32`) and annotation IDs (`uint16`). Its
+public API uses NumPy arrays rather than pandas DataFrames.
 
 ## Create a cache
 
