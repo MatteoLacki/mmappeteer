@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mmappeteer"
-version = "0.1.0"
+version = "0.2.0"
 description = "SQLite-indexed, mmappet-backed NumPy caches"
 readme = "README.md"
 authors = [
@@ -12,9 +12,8 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "mmappet>=0.1.1",
+    "mmappet>=0.2.0",
     "numpy",
-    "pandas",
 ]
 
 [project.optional-dependencies]

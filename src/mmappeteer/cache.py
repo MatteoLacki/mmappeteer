@@ -3,17 +3,15 @@ from __future__ import annotations
 import fcntl
 import json
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
 
 import numpy as np
-import pandas as pd
+import numpy.typing as npt
 from mmappet import DatasetWriter, open_dataset_dct
 
-
 SCHEMA_VERSION = 2
-KEY_COLUMNS = ("charge", "collision_energy", "sequence")
 INTENSITY_COLUMN = "predicted_intensity"
 ANNOTATION_COLUMN = "annotation_id"
 MAX_ANNOTATIONS = np.iinfo(np.uint16).max + 1
@@ -32,32 +30,163 @@ class CacheValidationError(CacheError):
 
 
 @dataclass(frozen=True)
-class LookupResult:
-    """A zero-copy view of cache storage plus ordered ranges for matching keys.
+class PredictionKeys:
+    """Parallel NumPy arrays forming ordered prediction cache keys."""
 
-    ``hits`` is in the same relative order as the submitted keys. Its ``start``
-    and ``end`` columns select matching slices from both storage arrays.
-    ``missing`` contains submitted keys that were not present, preserving their
-    order and original pandas index.
+    charge: npt.NDArray[np.int64]
+    collision_energy: npt.NDArray[np.float32]
+    sequence: npt.NDArray[np.object_]
+
+    @classmethod
+    def validate(
+        cls,
+        *,
+        charge: npt.ArrayLike,
+        collision_energy: npt.ArrayLike,
+        sequence: npt.ArrayLike,
+    ) -> PredictionKeys:
+        """Normalize arrays, validate key invariants, and construct keys."""
+
+        normalized_charge = _normalize_integer_array(charge, "charge", minimum=1)
+        normalized_energy = _normalize_collision_energy(collision_energy)
+        normalized_sequence = _normalize_string_array(sequence, "sequence")
+        lengths = (
+            len(normalized_charge),
+            len(normalized_energy),
+            len(normalized_sequence),
+        )
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                "charge, collision_energy, and sequence must have equal "
+                f"lengths; got {lengths}"
+            )
+        return cls(
+            charge=normalized_charge,
+            collision_energy=normalized_energy,
+            sequence=normalized_sequence,
+        )
+
+    def __len__(self) -> int:
+        return len(self.charge)
+
+    def take(self, indices: npt.ArrayLike) -> PredictionKeys:
+        """Select keys by an integer index array or Boolean mask."""
+
+        selector = np.asarray(indices)
+        if selector.ndim != 1:
+            raise ValueError("indices must be one-dimensional")
+        if selector.dtype.kind == "b":
+            if len(selector) != len(self):
+                raise ValueError(
+                    "a Boolean selector must have the same length as the keys"
+                )
+            positions = np.flatnonzero(selector)
+        elif selector.dtype.kind in "iu":
+            positions = selector.astype(np.intp, copy=False)
+        else:
+            raise TypeError("indices must contain integers or Booleans")
+        return PredictionKeys.validate(
+            charge=np.take(self.charge, positions),
+            collision_energy=np.take(self.collision_energy, positions),
+            sequence=np.take(self.sequence, positions),
+        )
+
+
+@dataclass(frozen=True)
+class PackedPredictions:
+    """Flattened variable-length prediction vectors and their offsets."""
+
+    predicted_intensities: npt.NDArray[np.float32]
+    annotation_ids: npt.NDArray[np.uint16]
+    offsets: npt.NDArray[np.int64]
+
+    @classmethod
+    def validate(
+        cls,
+        *,
+        predicted_intensities: npt.ArrayLike,
+        annotation_ids: npt.ArrayLike,
+        offsets: npt.ArrayLike,
+    ) -> PackedPredictions:
+        """Normalize arrays, validate packed invariants, and construct data."""
+
+        intensities = np.asarray(predicted_intensities, dtype=np.float32)
+        normalized_annotation_ids = _normalize_integer_array(
+            annotation_ids,
+            "annotation_ids",
+            minimum=0,
+            maximum=np.iinfo(np.uint16).max,
+            dtype=np.uint16,
+        )
+        normalized_offsets = _normalize_integer_array(
+            offsets, "offsets", minimum=0, dtype=np.int64
+        )
+        if intensities.ndim != 1:
+            raise ValueError("predicted_intensities must be one-dimensional")
+        if len(intensities) != len(normalized_annotation_ids):
+            raise ValueError(
+                "predicted_intensities and annotation_ids must have equal lengths"
+            )
+        if len(normalized_offsets) == 0:
+            raise ValueError("offsets must contain at least the initial zero")
+        if normalized_offsets[0] != 0:
+            raise ValueError("offsets must start at zero")
+        if np.any(normalized_offsets[1:] < normalized_offsets[:-1]):
+            raise ValueError("offsets must be non-decreasing")
+        if normalized_offsets[-1] != len(intensities):
+            raise ValueError("the final offset must equal the flattened vector length")
+        return cls(
+            predicted_intensities=intensities,
+            annotation_ids=normalized_annotation_ids,
+            offsets=normalized_offsets,
+        )
+
+    def __len__(self) -> int:
+        return len(self.offsets) - 1
+
+
+@dataclass(frozen=True)
+class AppendResult:
+    """Half-open mmappet ranges aligned with appended keys."""
+
+    starts: npt.NDArray[np.int64]
+    ends: npt.NDArray[np.int64]
+
+
+@dataclass(frozen=True)
+class AnnotationVocabulary:
+    """Contiguously numbered annotation names."""
+
+    ids: npt.NDArray[np.uint16]
+    names: npt.NDArray[np.object_]
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+
+@dataclass(frozen=True)
+class LookupResult:
+    """Mmap-backed storage and ranges aligned with every submitted key.
+
+    Missing keys have ``start == end == -1`` and ``found == False``.
     """
 
     predicted_intensities: np.ndarray
     annotation_ids: np.ndarray
-    hits: pd.DataFrame
-    missing: pd.DataFrame
+    starts: npt.NDArray[np.int64]
+    ends: npt.NDArray[np.int64]
+    found: npt.NDArray[np.bool_]
 
     @property
-    def starts(self) -> np.ndarray:
-        return self.hits["start"].to_numpy(dtype=np.int64, copy=False)
-
-    @property
-    def ends(self) -> np.ndarray:
-        return self.hits["end"].to_numpy(dtype=np.int64, copy=False)
+    def missing_positions(self) -> npt.NDArray[np.int64]:
+        return np.flatnonzero(~self.found)
 
     def iter_arrays(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        """Yield an intensity and annotation-ID view for every matching key."""
+        """Yield array views for found keys in submitted-key order."""
 
-        for start, end in zip(self.starts, self.ends):
+        for position in np.flatnonzero(self.found):
+            start = self.starts[position]
+            end = self.ends[position]
             yield (
                 self.predicted_intensities[start:end],
                 self.annotation_ids[start:end],
@@ -88,23 +217,28 @@ class PredictionCache:
     def create(
         cls,
         path: str | Path,
-        annotations: Sequence[str],
+        annotations: npt.ArrayLike,
         *,
-        model_names: str | Sequence[str],
-    ) -> "PredictionCache":
+        model_names: str | npt.ArrayLike,
+    ) -> PredictionCache:
         """Create a cache for predictions produced by one or more models."""
 
         path = Path(path)
-        annotation_names = _validate_annotation_names(annotations)
-        normalized_model_names = _validate_model_names(model_names)
+        annotation_names = _validate_names(annotations, "annotations")
+        if len(annotation_names) > MAX_ANNOTATIONS:
+            raise ValueError(
+                f"At most {MAX_ANNOTATIONS} annotations fit in uint16 storage"
+            )
+        normalized_model_names = _validate_names(
+            [model_names] if isinstance(model_names, str) else model_names,
+            "model_names",
+        )
         database_path = path / cls.database_filename
         dataset_path = path / cls.dataset_filename
 
         path.mkdir(parents=True, exist_ok=True)
         if database_path.exists() or dataset_path.exists():
-            raise FileExistsError(
-                f"Refusing to overwrite an existing cache at {path}"
-            )
+            raise FileExistsError(f"Refusing to overwrite an existing cache at {path}")
 
         connection = sqlite3.connect(database_path)
         try:
@@ -119,8 +253,7 @@ class PredictionCache:
                 ) STRICT, WITHOUT ROWID;
 
                 CREATE TABLE annotations (
-                    annotation_id INTEGER PRIMARY KEY
-                                  CHECK (annotation_id >= 0),
+                    annotation_id INTEGER PRIMARY KEY CHECK (annotation_id >= 0),
                     annotation    TEXT NOT NULL UNIQUE
                 ) STRICT;
 
@@ -145,7 +278,7 @@ class PredictionCache:
                     (
                         "model_names",
                         json.dumps(
-                            normalized_model_names,
+                            normalized_model_names.tolist(),
                             ensure_ascii=False,
                             separators=(",", ":"),
                         ),
@@ -154,7 +287,7 @@ class PredictionCache:
             )
             connection.executemany(
                 "INSERT INTO annotations(annotation_id, annotation) VALUES (?, ?)",
-                enumerate(annotation_names),
+                enumerate(annotation_names.tolist()),
             )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
@@ -163,8 +296,7 @@ class PredictionCache:
             database_path.unlink(missing_ok=True)
             raise
         finally:
-            if connection:
-                connection.close()
+            connection.close()
 
         try:
             with DatasetWriter.new(
@@ -178,11 +310,10 @@ class PredictionCache:
             raise
 
         (path / cls.lock_filename).touch(exist_ok=True)
-
         return cls(path)
 
-    def annotations(self) -> pd.DataFrame:
-        """Return the complete annotation vocabulary in ID order."""
+    def annotations(self) -> AnnotationVocabulary:
+        """Return the complete annotation vocabulary as NumPy arrays."""
 
         with self._connect() as connection:
             rows = connection.execute(
@@ -192,10 +323,13 @@ class PredictionCache:
                 ORDER BY annotation_id
                 """
             ).fetchall()
-        return pd.DataFrame(rows, columns=["annotation_id", "annotation"])
+        return AnnotationVocabulary(
+            ids=np.fromiter((row[0] for row in rows), dtype=np.uint16),
+            names=np.asarray([row[1] for row in rows], dtype=object),
+        )
 
-    def model_names(self) -> tuple[str, ...]:
-        """Return the model provenance recorded when the cache was created."""
+    def model_names(self) -> npt.NDArray[np.object_]:
+        """Return model provenance as a one-dimensional string array."""
 
         with self._connect() as connection:
             row = connection.execute(
@@ -203,7 +337,7 @@ class PredictionCache:
             ).fetchone()
         if row is None:
             raise CacheValidationError("metadata is missing model_names")
-        return tuple(_decode_model_names(row[0]))
+        return _decode_model_names(row[0])
 
     def append(
         self,
@@ -211,177 +345,180 @@ class PredictionCache:
         charge: int,
         collision_energy: float,
         sequence: str,
-        predicted_intensities: Sequence[float] | np.ndarray,
-        annotation_ids: Sequence[int] | np.ndarray,
+        predicted_intensities: npt.ArrayLike,
+        annotation_ids: npt.ArrayLike,
     ) -> tuple[int, int]:
         """Append one prediction to the cache.
-
-        Parameters
-        ----------
-        charge
-            Precursor charge; must be an integer greater than or equal to one.
-        collision_energy
-            Collision energy, normalized to ``float32`` for the cache key.
-        sequence
-            Peptide sequence used in the cache key.
-        predicted_intensities
-            One-dimensional intensity vector. Values are stored as ``float32``.
-        annotation_ids
-            One-dimensional annotation-ID vector aligned with
-            ``predicted_intensities``. Values are stored as ``uint16``.
 
         Returns
         -------
         start : int
-            Inclusive row offset of the appended vectors in mmappet storage.
+            Inclusive row offset of the appended vectors.
         end : int
-            Exclusive row offset of the appended vectors in mmappet storage.
-            The stored vectors are selected with ``storage[start:end]``.
+            Exclusive row offset of the appended vectors.
         """
 
-        keys = pd.DataFrame(
-            {
-                "charge": [charge],
-                "collision_energy": [collision_energy],
-                "sequence": [sequence],
-            }
+        intensities = np.asarray(predicted_intensities, dtype=np.float32)
+        result = self.append_many(
+            PredictionKeys.validate(
+                charge=np.asarray([charge]),
+                collision_energy=np.asarray([collision_energy]),
+                sequence=np.asarray([sequence]),
+            ),
+            PackedPredictions.validate(
+                predicted_intensities=intensities,
+                annotation_ids=np.asarray(annotation_ids),
+                offsets=np.asarray([0, len(intensities)], dtype=np.int64),
+            ),
         )
-        ranges = self.append_many(
-            keys,
-            predicted_intensities=[predicted_intensities],
-            annotation_ids=[annotation_ids],
-        )
-        return int(ranges.iloc[0]["start"]), int(ranges.iloc[0]["end"])
+        return int(result.starts[0]), int(result.ends[0])
 
     def append_many(
         self,
-        keys: pd.DataFrame,
-        *,
-        predicted_intensities: Sequence[Sequence[float] | np.ndarray],
-        annotation_ids: Sequence[Sequence[int] | np.ndarray],
-    ) -> pd.DataFrame:
-        """Append several predictions in submitted-key order.
-
-        Parameters
-        ----------
-        keys
-            DataFrame containing ``charge``, ``collision_energy``, and
-            ``sequence`` columns. Its row order determines append order.
-        predicted_intensities
-            One one-dimensional intensity vector per row in ``keys``.
-        annotation_ids
-            One one-dimensional annotation-ID vector per row in ``keys``.
-            Each vector must align with its corresponding intensity vector.
+        keys: PredictionKeys,
+        predictions: PackedPredictions,
+    ) -> AppendResult:
+        """Append a packed prediction batch with one write per mmappet column.
 
         Returns
         -------
-        pandas.DataFrame
-            A DataFrame with ``start`` and ``end`` columns and the same index
-            and row order as ``keys``. Each row describes a half-open mmappet
-            range ``[start, end)`` shared by the corresponding intensity and
-            annotation-ID vectors.
+        AppendResult
+            ``starts`` and ``ends`` are ``int64`` arrays aligned with ``keys``.
+            Each pair describes a half-open range ``[start, end)`` shared by
+            the corresponding intensity and annotation-ID vectors.
         """
 
-        normalized_keys = _normalize_keys(keys)
-        intensity_vectors = list(predicted_intensities)
-        annotation_vectors = list(annotation_ids)
-        if not (
-            len(normalized_keys)
-            == len(intensity_vectors)
-            == len(annotation_vectors)
+        if not isinstance(keys, PredictionKeys):
+            raise TypeError("keys must be a PredictionKeys instance")
+        if not isinstance(predictions, PackedPredictions):
+            raise TypeError("predictions must be a PackedPredictions instance")
+        keys = PredictionKeys.validate(
+            charge=keys.charge,
+            collision_energy=keys.collision_energy,
+            sequence=keys.sequence,
+        )
+        predictions = PackedPredictions.validate(
+            predicted_intensities=predictions.predicted_intensities,
+            annotation_ids=predictions.annotation_ids,
+            offsets=predictions.offsets,
+        )
+        if len(keys) != len(predictions):
+            raise ValueError(
+                f"keys has {len(keys)} entries but predictions has {len(predictions)}"
+            )
+
+        with self._connect() as connection:
+            annotation_count = connection.execute(
+                "SELECT COUNT(*) FROM annotations"
+            ).fetchone()[0]
+        if len(predictions.annotation_ids) and np.any(
+            predictions.annotation_ids >= annotation_count
         ):
             raise ValueError(
-                "keys, predicted_intensities, and annotation_ids must have "
-                "the same number of entries"
+                f"annotation_ids must be between 0 and {annotation_count - 1}"
             )
-        if normalized_keys.duplicated(list(KEY_COLUMNS)).any():
-            raise ValueError("keys contains duplicate cache keys")
 
-        annotation_count = len(self.annotations())
-        arrays = [
-            _normalize_arrays(intensities, ids, annotation_count)
-            for intensities, ids in zip(intensity_vectors, annotation_vectors)
-        ]
-
-        ranges: list[tuple[int, int]] = []
         self.lock_path.touch(exist_ok=True)
         with self.lock_path.open("rb") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
                 with self._connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
-                    existing = _lookup_rows(connection, normalized_keys)
-                    if any(row[4] is not None for row in existing):
-                        duplicate_positions = [
-                            row[0] for row in existing if row[4] is not None
-                        ]
+                    _prepare_requested_keys(connection, keys)
+                    duplicate = connection.execute(
+                        """
+                        SELECT MIN(request_position)
+                        FROM requested_keys
+                        GROUP BY charge, collision_energy, sequence
+                        HAVING COUNT(*) > 1
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if duplicate is not None:
                         raise CacheKeyExistsError(
-                            "Cache keys already exist at submitted positions "
-                            f"{duplicate_positions}"
+                            "duplicate cache keys in the submitted batch"
                         )
 
-                    with DatasetWriter(self.dataset_path, append_ok=True) as writer:
-                        for intensities, ids in arrays:
-                            start = len(writer)
-                            writer.append(
-                                predicted_intensity=intensities,
-                                annotation_id=ids,
-                            )
-                            ranges.append((start, len(writer)))
-                        writer.flush()
+                    existing = connection.execute(
+                        """
+                        SELECT requested_keys.request_position
+                        FROM requested_keys
+                        JOIN cache_entries USING (
+                            charge, collision_energy, sequence
+                        )
+                        ORDER BY requested_keys.request_position
+                        """
+                    ).fetchall()
+                    if existing:
+                        positions = [row[0] for row in existing]
+                        raise CacheKeyExistsError(
+                            "Cache keys already exist at submitted positions "
+                            f"{positions}"
+                        )
 
+                    if len(keys):
+                        with DatasetWriter(self.dataset_path, append_ok=True) as writer:
+                            storage_start = len(writer)
+                            writer.append(
+                                predicted_intensity=(predictions.predicted_intensities),
+                                annotation_id=predictions.annotation_ids,
+                            )
+                            writer.flush()
+                    else:
+                        storage_start = self._storage_length()
+
+                    ranges = storage_start + predictions.offsets
+                    starts = ranges[:-1].astype(np.int64, copy=False)
+                    ends = ranges[1:].astype(np.int64, copy=False)
                     connection.executemany(
                         """
                         INSERT INTO cache_entries(
                             charge, collision_energy, sequence, start, end
                         ) VALUES (?, ?, ?, ?, ?)
                         """,
-                        (
-                            (
-                                int(key.charge),
-                                float(key.collision_energy),
-                                key.sequence,
-                                start,
-                                end,
-                            )
-                            for key, (start, end) in zip(
-                                normalized_keys.itertuples(index=False), ranges
-                            )
+                        zip(
+                            map(int, keys.charge),
+                            map(float, keys.collision_energy),
+                            map(str, keys.sequence),
+                            map(int, starts),
+                            map(int, ends),
                         ),
                     )
                     connection.commit()
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-        return pd.DataFrame(ranges, columns=["start", "end"], index=keys.index)
+        return AppendResult(starts=starts, ends=ends)
 
-    def lookup(self, keys: pd.DataFrame) -> LookupResult:
-        """Look up keys without copying the cached vectors.
+    def lookup(self, keys: PredictionKeys) -> LookupResult:
+        """Return mmap storage and result ranges aligned with submitted keys."""
 
-        Hits and missing keys both preserve submission order. Duplicate
-        submitted keys are supported.
-        """
-
-        normalized_keys = _normalize_keys(keys)
+        if not isinstance(keys, PredictionKeys):
+            raise TypeError("keys must be a PredictionKeys instance")
+        keys = PredictionKeys.validate(
+            charge=keys.charge,
+            collision_energy=keys.collision_energy,
+            sequence=keys.sequence,
+        )
         with self._connect() as connection:
-            rows = _lookup_rows(connection, normalized_keys)
+            rows = _lookup_rows(connection, keys)
 
-        hit_positions = [row[0] for row in rows if row[4] is not None]
-        missing_positions = [row[0] for row in rows if row[4] is None]
-
-        hits = keys.iloc[hit_positions][list(KEY_COLUMNS)].copy()
-        hits["start"] = [rows[pos][4] for pos in hit_positions]
-        hits["end"] = [rows[pos][5] for pos in hit_positions]
-        hits["start"] = hits["start"].astype(np.int64)
-        hits["end"] = hits["end"].astype(np.int64)
-        missing = keys.iloc[missing_positions][list(KEY_COLUMNS)].copy()
+        starts = np.full(len(keys), -1, dtype=np.int64)
+        ends = np.full(len(keys), -1, dtype=np.int64)
+        found = np.zeros(len(keys), dtype=bool)
+        for position, start, end in rows:
+            if start is not None and end is not None:
+                starts[position] = start
+                ends[position] = end
+                found[position] = True
 
         storage = open_dataset_dct(self.dataset_path)
         return LookupResult(
             predicted_intensities=storage[INTENSITY_COLUMN],
             annotation_ids=storage[ANNOTATION_COLUMN],
-            hits=hits,
-            missing=missing,
+            starts=starts,
+            ends=ends,
+            found=found,
         )
 
     def validate(self) -> None:
@@ -389,9 +526,7 @@ class PredictionCache:
 
         storage = open_dataset_dct(self.dataset_path)
         if set(storage) != {INTENSITY_COLUMN, ANNOTATION_COLUMN}:
-            raise CacheValidationError(
-                f"Unexpected mmappet columns: {list(storage)}"
-            )
+            raise CacheValidationError(f"Unexpected mmappet columns: {list(storage)}")
         if storage[INTENSITY_COLUMN].dtype != np.dtype(np.float32):
             raise CacheValidationError("predicted_intensity must have dtype float32")
         if storage[ANNOTATION_COLUMN].dtype != np.dtype(np.uint16):
@@ -422,13 +557,18 @@ class PredictionCache:
                 raise CacheValidationError("metadata is missing model_names")
             _decode_model_names(metadata["model_names"])
 
-            annotation_ids = [
-                row[0]
-                for row in connection.execute(
-                    "SELECT annotation_id FROM annotations ORDER BY annotation_id"
-                )
-            ]
-            if annotation_ids != list(range(len(annotation_ids))):
+            annotation_ids = np.fromiter(
+                (
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT annotation_id FROM annotations ORDER BY annotation_id"
+                    )
+                ),
+                dtype=np.int64,
+            )
+            if not np.array_equal(
+                annotation_ids, np.arange(len(annotation_ids), dtype=np.int64)
+            ):
                 raise CacheValidationError(
                     "annotations.annotation_id values must be contiguous from zero"
                 )
@@ -468,9 +608,10 @@ class PredictionCache:
                 """
             ).fetchone()
             if overlap is not None:
-                raise CacheValidationError(
-                    f"Overlapping cache ranges found: {overlap}"
-                )
+                raise CacheValidationError(f"Overlapping cache ranges found: {overlap}")
+
+    def _storage_length(self) -> int:
+        return len(open_dataset_dct(self.dataset_path)[INTENSITY_COLUMN])
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
@@ -478,35 +619,74 @@ class PredictionCache:
         return connection
 
 
-def _validate_annotation_names(annotations: Sequence[str]) -> list[str]:
-    names = list(annotations)
-    if not names:
-        raise ValueError("annotations must contain at least one entry")
-    if len(names) > MAX_ANNOTATIONS:
-        raise ValueError(
-            f"At most {MAX_ANNOTATIONS} annotations fit in the uint16 storage"
-        )
-    if any(not isinstance(name, str) for name in names):
-        raise TypeError("every annotation must be a string")
-    if len(set(names)) != len(names):
-        raise ValueError("annotations must be unique")
+def _normalize_integer_array(
+    values: npt.ArrayLike,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int = np.iinfo(np.int64).max,
+    dtype: npt.DTypeLike = np.int64,
+) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if len(array) == 0:
+        return np.empty(0, dtype=dtype)
+    if array.dtype.kind not in "iu":
+        raise TypeError(f"{name} must contain integers")
+    if len(array) and (np.any(array < minimum) or np.any(array > maximum)):
+        raise ValueError(f"{name} values must be between {minimum} and {maximum}")
+    return array.astype(dtype, copy=False)
+
+
+def _normalize_collision_energy(values: npt.ArrayLike) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError("collision_energy must be one-dimensional")
+    if array.dtype.kind not in "iuf":
+        raise TypeError("collision_energy must contain numeric values")
+    with np.errstate(over="ignore", invalid="ignore"):
+        normalized = array.astype(np.float32, copy=False)
+    if not np.all(np.isfinite(normalized)):
+        raise ValueError("collision_energy must contain finite values")
+    return normalized
+
+
+def _normalize_string_array(values: npt.ArrayLike, name: str) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if len(array) == 0:
+        return np.empty(0, dtype=object)
+    if array.dtype.kind == "U":
+        return array.astype(object)
+    if array.dtype.kind != "O":
+        raise TypeError(f"{name} must contain strings")
+    valid = np.fromiter(
+        (isinstance(value, str) for value in array),
+        dtype=bool,
+        count=len(array),
+    )
+    if not np.all(valid):
+        raise TypeError(f"{name} must contain strings")
+    return array
+
+
+def _validate_names(values: npt.ArrayLike, name: str) -> np.ndarray:
+    names = _normalize_string_array(values, name)
+    if len(names) == 0:
+        raise ValueError(f"{name} must contain at least one entry")
+    nonempty = np.fromiter(
+        (bool(value.strip()) for value in names), dtype=bool, count=len(names)
+    )
+    if not np.all(nonempty):
+        raise ValueError(f"{name} entries must not be empty")
+    if len(set(names.tolist())) != len(names):
+        raise ValueError(f"{name} entries must be unique")
     return names
 
 
-def _validate_model_names(model_names: str | Sequence[str]) -> list[str]:
-    names = [model_names] if isinstance(model_names, str) else list(model_names)
-    if not names:
-        raise ValueError("model_names must contain at least one entry")
-    if any(not isinstance(name, str) for name in names):
-        raise TypeError("every model name must be a string")
-    if any(not name.strip() for name in names):
-        raise ValueError("model names must not be empty")
-    if len(set(names)) != len(names):
-        raise ValueError("model names must be unique")
-    return names
-
-
-def _decode_model_names(value: str) -> list[str]:
+def _decode_model_names(value: str) -> np.ndarray:
     try:
         names = json.loads(value)
     except (TypeError, json.JSONDecodeError) as error:
@@ -516,108 +696,14 @@ def _decode_model_names(value: str) -> list[str]:
     if not isinstance(names, list):
         raise CacheValidationError("metadata model_names must be a JSON string list")
     try:
-        return _validate_model_names(names)
+        return _validate_names(names, "model_names")
     except (TypeError, ValueError) as error:
         raise CacheValidationError(f"Invalid metadata model_names: {error}") from error
 
 
-def _normalize_keys(keys: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(keys, pd.DataFrame):
-        raise TypeError("keys must be a pandas DataFrame")
-    missing_columns = [column for column in KEY_COLUMNS if column not in keys]
-    if missing_columns:
-        raise ValueError(f"keys is missing columns: {missing_columns}")
-
-    normalized = keys.loc[:, list(KEY_COLUMNS)].copy()
-    if normalized.empty:
-        normalized["charge"] = np.empty(0, dtype=np.int64)
-        normalized["collision_energy"] = np.empty(0, dtype=np.float32)
-        return normalized
-
-    charge_kind = pd.api.types.infer_dtype(normalized["charge"], skipna=False)
-    if charge_kind not in {"integer", "floating", "mixed-integer-float"}:
-        raise TypeError("charge must contain integers")
-    try:
-        charge_values = normalized["charge"].to_numpy(dtype=np.float64)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise TypeError("charge must contain integers") from error
-    valid_charges = (
-        np.isfinite(charge_values)
-        & (charge_values >= 1)
-        & (charge_values == np.floor(charge_values))
-        & (charge_values <= np.iinfo(np.int64).max)
-    )
-    if not np.all(valid_charges):
-        invalid = np.flatnonzero(~valid_charges).tolist()
-        raise ValueError(
-            "charge must contain integers >= 1; invalid submitted positions "
-            f"{invalid}"
-        )
-
-    energy_kind = pd.api.types.infer_dtype(
-        normalized["collision_energy"], skipna=False
-    )
-    if energy_kind not in {
-        "integer",
-        "floating",
-        "mixed-integer-float",
-        "decimal",
-    }:
-        raise TypeError("collision_energy must contain numeric values")
-    try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            energy_values = normalized["collision_energy"].to_numpy(
-                dtype=np.float32
-            )
-    except (TypeError, ValueError, OverflowError) as error:
-        raise TypeError("collision_energy must contain numeric values") from error
-    valid_energies = np.isfinite(energy_values)
-    if not np.all(valid_energies):
-        invalid = np.flatnonzero(~valid_energies).tolist()
-        raise ValueError(
-            "collision_energy must contain finite values; invalid submitted "
-            f"positions {invalid}"
-        )
-
-    sequence_kind = pd.api.types.infer_dtype(
-        normalized["sequence"], skipna=False
-    )
-    if sequence_kind not in {"string", "unicode"}:
-        raise TypeError("sequence must contain strings")
-
-    normalized["charge"] = charge_values.astype(np.int64)
-    normalized["collision_energy"] = energy_values
-    return normalized
-
-
-def _normalize_arrays(
-    predicted_intensities: Sequence[float] | np.ndarray,
-    annotation_ids: Sequence[int] | np.ndarray,
-    annotation_count: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    intensities = np.asarray(predicted_intensities, dtype=np.float32)
-    raw_ids = np.asarray(annotation_ids)
-    if intensities.ndim != 1 or raw_ids.ndim != 1:
-        raise ValueError("predicted_intensities and annotation_ids must be 1-D")
-    if len(intensities) != len(raw_ids):
-        raise ValueError(
-            "predicted_intensities and annotation_ids must have equal lengths"
-        )
-    if not np.issubdtype(raw_ids.dtype, np.integer):
-        raise TypeError("annotation_ids must contain integers")
-    if len(raw_ids) and (
-        np.any(raw_ids < 0) or np.any(raw_ids >= annotation_count)
-    ):
-        raise ValueError(
-            f"annotation_ids must be between 0 and {annotation_count - 1}"
-        )
-    return intensities, raw_ids.astype(np.uint16, copy=False)
-
-
-def _lookup_rows(
-    connection: sqlite3.Connection,
-    normalized_keys: pd.DataFrame,
-) -> list[tuple[int, int, float, str, int | None, int | None]]:
+def _prepare_requested_keys(
+    connection: sqlite3.Connection, keys: PredictionKeys
+) -> None:
     connection.execute("DROP TABLE IF EXISTS temp.requested_keys")
     connection.execute(
         """
@@ -635,24 +721,22 @@ def _lookup_rows(
             request_position, charge, collision_energy, sequence
         ) VALUES (?, ?, ?, ?)
         """,
-        (
-            (
-                position,
-                int(key.charge),
-                float(key.collision_energy),
-                key.sequence,
-            )
-            for position, key in enumerate(
-                normalized_keys.itertuples(index=False)
-            )
+        zip(
+            range(len(keys)),
+            map(int, keys.charge),
+            map(float, keys.collision_energy),
+            map(str, keys.sequence),
         ),
     )
+
+
+def _lookup_rows(
+    connection: sqlite3.Connection, keys: PredictionKeys
+) -> list[tuple[int, int | None, int | None]]:
+    _prepare_requested_keys(connection, keys)
     return connection.execute(
         """
         SELECT requested_keys.request_position,
-               requested_keys.charge,
-               requested_keys.collision_energy,
-               requested_keys.sequence,
                cache_entries.start,
                cache_entries.end
         FROM requested_keys
