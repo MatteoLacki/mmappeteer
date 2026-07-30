@@ -1,3 +1,5 @@
+![mmappeteer logo](img/logo.png)
+
 # mmappeteer
 
 `mmappeteer` is an append-only NumPy prediction cache built from two pieces:
