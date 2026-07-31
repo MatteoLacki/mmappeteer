@@ -6,6 +6,8 @@
 half-open ranges; `mmappet` stores aligned, mmap-backed NumPy columns. The
 canonical key is `(charge, collision_energy, sequence)`. Each key maps to an
 intensity (`float32`) and annotation-ID (`uint16`) vector of equal length.
+Two scalar caches (retention time, ion mobility) share the same
+`index.sqlite3` but skip mmappet entirely -- see "Scalar caches" below.
 
 Start with `README.md`. Implementation is in `src/mmappeteer/cache.py`; tests
 are in `tests/test_cache.py`.
@@ -26,11 +28,28 @@ are in `tests/test_cache.py`.
 - Lookup storage arrays remain mmap-backed; do not copy the complete cache.
 - Keep the core free of pandas and DataFrame adapters.
 
+## Scalar caches (RT/IM)
+
+- `append_rt`/`lookup_rt` key on `sequence` alone; `append_im`/`lookup_im` key
+  on `(sequence, charge)`. Both store one scalar (`float64`) per key in a
+  plain SQLite table (`rt_cache_entries`/`im_cache_entries`) -- no mmappet
+  file, no ranges, since there's nothing ragged to pack.
+- Both return `ScalarLookupResult` (`values`, `found`, `missing_positions`),
+  the scalar counterpart to `LookupResult`.
+- Same de-duplication and existing-key-raise rules as `append_many` (below)
+  apply here too.
+
 ## Storage invariants
 
 - `charge` is an integer greater than or equal to one.
 - Normalize collision energy to `float32` before insertion and lookup.
-- Cache keys are unique. Never replace, update, or delete an existing entry.
+- Cache keys are unique. Never replace, update, or delete an existing entry
+  from a *previous* call -- `CacheKeyExistsError` guards this.
+- Keys repeated *within one* `append_many`/`append_rt`/`append_im` call are
+  de-duplicated automatically (first occurrence wins; every submitted
+  position, including later repeats, gets that entry's range/value back).
+  This is not a relaxation of the previous point -- it's resolving redundancy
+  within a single caller-submitted batch, not replacing a stored entry.
 - SQLite ranges are half-open: `[start, end)`.
 - Both mmappet columns always have the same row count.
 - Every stored annotation ID refers to the SQLite `annotations` table.

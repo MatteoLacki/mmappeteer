@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INTENSITY_COLUMN = "predicted_intensity"
 ANNOTATION_COLUMN = "annotation_id"
 MAX_ANNOTATIONS = np.iinfo(np.uint16).max + 1
@@ -172,6 +172,22 @@ class AnnotationVocabulary:
 
 
 @dataclass(frozen=True)
+class ScalarLookupResult:
+    """Scalar values and a found mask aligned with every submitted key.
+
+    Used by the RT/IM scalar caches (one value per key, no ragged storage),
+    unlike ``LookupResult``'s mmap-backed ranges for the intensity cache.
+    """
+
+    values: npt.NDArray[np.float64]
+    found: npt.NDArray[np.bool_]
+
+    @property
+    def missing_positions(self) -> npt.NDArray[np.int64]:
+        return np.flatnonzero(~self.found)
+
+
+@dataclass(frozen=True)
 class LookupResult:
     """Mmap-backed storage and ranges aligned with every submitted key.
 
@@ -271,6 +287,19 @@ class PredictionCache:
                     start            INTEGER NOT NULL CHECK (start >= 0),
                     end              INTEGER NOT NULL CHECK (end >= start),
                     PRIMARY KEY (charge, collision_energy, sequence)
+                ) STRICT, WITHOUT ROWID;
+
+                CREATE TABLE rt_cache_entries (
+                    sequence       TEXT NOT NULL,
+                    retention_time REAL NOT NULL,
+                    PRIMARY KEY (sequence)
+                ) STRICT, WITHOUT ROWID;
+
+                CREATE TABLE im_cache_entries (
+                    sequence     TEXT NOT NULL,
+                    charge       INTEGER NOT NULL CHECK (charge >= 1),
+                    ion_mobility REAL NOT NULL,
+                    PRIMARY KEY (sequence, charge)
                 ) STRICT, WITHOUT ROWID;
                 """
             )
@@ -387,6 +416,14 @@ class PredictionCache:
     ) -> AppendResult:
         """Append a packed prediction batch with one write per mmappet column.
 
+        Keys repeated within the same batch are de-duplicated automatically
+        (first occurrence wins) -- every submitted position still gets an
+        aligned range in the result, including repeated positions, which
+        point at the single physically-stored entry. A key that already
+        exists in the cache from a *previous* call still raises
+        ``CacheKeyExistsError`` -- callers are expected to filter
+        previously-cached keys via ``lookup()`` first.
+
         Returns
         -------
         AppendResult
@@ -425,6 +462,17 @@ class PredictionCache:
                 f"annotation_ids must be between 0 and {annotation_count - 1}"
             )
 
+        first_occurrence = _first_occurrence_positions(
+            list(
+                zip(
+                    map(int, keys.charge),
+                    map(float, keys.collision_energy),
+                    map(str, keys.sequence),
+                )
+            )
+        )
+        first_indices = np.flatnonzero(first_occurrence == np.arange(len(keys)))
+
         self.lock_path.touch(exist_ok=True)
         with self.lock_path.open("rb") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
@@ -432,19 +480,6 @@ class PredictionCache:
                 with self._connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     _prepare_requested_keys(connection, keys)
-                    duplicate = connection.execute(
-                        """
-                        SELECT MIN(request_position)
-                        FROM requested_keys
-                        GROUP BY charge, collision_energy, sequence
-                        HAVING COUNT(*) > 1
-                        LIMIT 1
-                        """
-                    ).fetchone()
-                    if duplicate is not None:
-                        raise CacheKeyExistsError(
-                            "duplicate cache keys in the submitted batch"
-                        )
 
                     existing = connection.execute(
                         """
@@ -485,19 +520,27 @@ class PredictionCache:
                             charge, collision_energy, sequence, start, end
                         ) VALUES (?, ?, ?, ?, ?)
                         """,
-                        zip(
-                            map(int, keys.charge),
-                            map(float, keys.collision_energy),
-                            map(str, keys.sequence),
-                            map(int, starts),
-                            map(int, ends),
+                        (
+                            (
+                                int(keys.charge[i]),
+                                float(keys.collision_energy[i]),
+                                str(keys.sequence[i]),
+                                int(starts[i]),
+                                int(ends[i]),
+                            )
+                            for i in first_indices
                         ),
                     )
                     connection.commit()
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-        return AppendResult(starts=starts, ends=ends)
+        # Duplicate positions report their group's first-occurrence range;
+        # their own slice is still physically present in mmappet storage,
+        # just unreferenced by any cache_entries row.
+        aligned_starts = starts[first_occurrence]
+        aligned_ends = ends[first_occurrence]
+        return AppendResult(starts=aligned_starts, ends=aligned_ends)
 
     def lookup(self, keys: PredictionKeys) -> LookupResult:
         """Return mmap storage and result ranges aligned with submitted keys."""
@@ -529,6 +572,225 @@ class PredictionCache:
             ends=ends,
             found=found,
         )
+
+    def append_rt(
+        self,
+        *,
+        sequence: npt.ArrayLike,
+        retention_time: npt.ArrayLike,
+    ) -> None:
+        """Append retention-time predictions keyed by sequence alone.
+
+        Scalar-per-key, no ragged storage -- unlike ``append_many``, there is
+        no mmappet array file or range to return. Keys repeated within the
+        same batch are de-duplicated (first occurrence wins). A sequence
+        that already has a cached retention time still raises
+        ``CacheKeyExistsError``.
+        """
+
+        sequences = _normalize_string_array(sequence, "sequence")
+        values = _normalize_float_array(retention_time, "retention_time")
+        if len(sequences) != len(values):
+            raise ValueError(
+                f"sequence has {len(sequences)} entries but retention_time "
+                f"has {len(values)}"
+            )
+
+        first_occurrence = _first_occurrence_positions(list(map(str, sequences)))
+        first_indices = np.flatnonzero(
+            first_occurrence == np.arange(len(sequences))
+        )
+
+        self.lock_path.touch(exist_ok=True)
+        with self.lock_path.open("rb") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if len(sequences):
+                        placeholders = ",".join("?" * len(sequences))
+                        existing = connection.execute(
+                            f"""
+                            SELECT sequence FROM rt_cache_entries
+                            WHERE sequence IN ({placeholders})
+                            """,
+                            [str(s) for s in sequences],
+                        ).fetchall()
+                        if existing:
+                            raise CacheKeyExistsError(
+                                "Retention-time cache keys already exist: "
+                                f"{sorted(row[0] for row in existing)}"
+                            )
+                    connection.executemany(
+                        """
+                        INSERT INTO rt_cache_entries(sequence, retention_time)
+                        VALUES (?, ?)
+                        """,
+                        (
+                            (str(sequences[i]), float(values[i]))
+                            for i in first_indices
+                        ),
+                    )
+                    connection.commit()
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def lookup_rt(self, *, sequence: npt.ArrayLike) -> ScalarLookupResult:
+        """Return retention-time values and a found mask aligned with keys."""
+
+        sequences = _normalize_string_array(sequence, "sequence")
+        values = np.zeros(len(sequences), dtype=np.float64)
+        found = np.zeros(len(sequences), dtype=bool)
+        if len(sequences):
+            with self._connect() as connection:
+                connection.execute("DROP TABLE IF EXISTS temp.requested_rt_keys")
+                connection.execute(
+                    """
+                    CREATE TEMP TABLE requested_rt_keys (
+                        request_position INTEGER PRIMARY KEY,
+                        sequence         TEXT NOT NULL
+                    ) STRICT
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO requested_rt_keys(request_position, sequence)
+                    VALUES (?, ?)
+                    """,
+                    enumerate(map(str, sequences)),
+                )
+                rows = connection.execute(
+                    """
+                    SELECT requested_rt_keys.request_position,
+                           rt_cache_entries.retention_time
+                    FROM requested_rt_keys
+                    LEFT JOIN rt_cache_entries USING (sequence)
+                    ORDER BY requested_rt_keys.request_position
+                    """
+                ).fetchall()
+            for position, retention_time in rows:
+                if retention_time is not None:
+                    values[position] = retention_time
+                    found[position] = True
+        return ScalarLookupResult(values=values, found=found)
+
+    def append_im(
+        self,
+        *,
+        sequence: npt.ArrayLike,
+        charge: npt.ArrayLike,
+        ion_mobility: npt.ArrayLike,
+    ) -> None:
+        """Append ion-mobility predictions keyed by ``(sequence, charge)``.
+
+        Scalar-per-key, same shape as ``append_rt``. Keys repeated within
+        the same batch are de-duplicated (first occurrence wins). A key
+        that already has a cached ion mobility still raises
+        ``CacheKeyExistsError``.
+        """
+
+        sequences = _normalize_string_array(sequence, "sequence")
+        charges = _normalize_integer_array(charge, "charge", minimum=1)
+        values = _normalize_float_array(ion_mobility, "ion_mobility")
+        lengths = (len(sequences), len(charges), len(values))
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                f"sequence, charge, and ion_mobility must have equal lengths; "
+                f"got {lengths}"
+            )
+
+        first_occurrence = _first_occurrence_positions(
+            list(zip(map(str, sequences), map(int, charges)))
+        )
+        first_indices = np.flatnonzero(
+            first_occurrence == np.arange(len(sequences))
+        )
+
+        self.lock_path.touch(exist_ok=True)
+        with self.lock_path.open("rb") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if len(sequences):
+                        pairs = ",".join("(?, ?)" for _ in sequences)
+                        existing = connection.execute(
+                            f"""
+                            SELECT sequence, charge FROM im_cache_entries
+                            WHERE (sequence, charge) IN ({pairs})
+                            """,
+                            [
+                                value
+                                for seq, ch in zip(sequences, charges)
+                                for value in (str(seq), int(ch))
+                            ],
+                        ).fetchall()
+                        if existing:
+                            raise CacheKeyExistsError(
+                                "Ion-mobility cache keys already exist: "
+                                f"{sorted(existing)}"
+                            )
+                    connection.executemany(
+                        """
+                        INSERT INTO im_cache_entries(sequence, charge, ion_mobility)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            (str(sequences[i]), int(charges[i]), float(values[i]))
+                            for i in first_indices
+                        ),
+                    )
+                    connection.commit()
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def lookup_im(
+        self, *, sequence: npt.ArrayLike, charge: npt.ArrayLike
+    ) -> ScalarLookupResult:
+        """Return ion-mobility values and a found mask aligned with keys."""
+
+        sequences = _normalize_string_array(sequence, "sequence")
+        charges = _normalize_integer_array(charge, "charge", minimum=1)
+        if len(sequences) != len(charges):
+            raise ValueError(
+                f"sequence has {len(sequences)} entries but charge has "
+                f"{len(charges)}"
+            )
+        values = np.zeros(len(sequences), dtype=np.float64)
+        found = np.zeros(len(sequences), dtype=bool)
+        if len(sequences):
+            with self._connect() as connection:
+                connection.execute("DROP TABLE IF EXISTS temp.requested_im_keys")
+                connection.execute(
+                    """
+                    CREATE TEMP TABLE requested_im_keys (
+                        request_position INTEGER PRIMARY KEY,
+                        sequence         TEXT NOT NULL,
+                        charge           INTEGER NOT NULL
+                    ) STRICT
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO requested_im_keys(request_position, sequence, charge)
+                    VALUES (?, ?, ?)
+                    """,
+                    zip(range(len(sequences)), map(str, sequences), map(int, charges)),
+                )
+                rows = connection.execute(
+                    """
+                    SELECT requested_im_keys.request_position,
+                           im_cache_entries.ion_mobility
+                    FROM requested_im_keys
+                    LEFT JOIN im_cache_entries USING (sequence, charge)
+                    ORDER BY requested_im_keys.request_position
+                    """
+                ).fetchall()
+            for position, ion_mobility in rows:
+                if ion_mobility is not None:
+                    values[position] = ion_mobility
+                    found[position] = True
+        return ScalarLookupResult(values=values, found=found)
 
     def validate(self) -> None:
         """Check schema versions, annotation numbering, and stored ranges."""
@@ -565,6 +827,21 @@ class PredictionCache:
             if "model_names" not in metadata:
                 raise CacheValidationError("metadata is missing model_names")
             _decode_model_names(metadata["model_names"])
+
+            existing_tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            missing_tables = (
+                {"cache_entries", "rt_cache_entries", "im_cache_entries"}
+                - existing_tables
+            )
+            if missing_tables:
+                raise CacheValidationError(
+                    f"Missing required tables: {sorted(missing_tables)}"
+                )
 
             annotation_ids = np.fromiter(
                 (
@@ -648,6 +925,36 @@ def _normalize_integer_array(
     if len(array) and (np.any(array < minimum) or np.any(array > maximum)):
         raise ValueError(f"{name} values must be between {minimum} and {maximum}")
     return array.astype(dtype, copy=False)
+
+
+def _first_occurrence_positions(key_tuples: list) -> np.ndarray:
+    """For each position, return the index of its group's first occurrence.
+
+    Shared de-duplication logic for ``append_many``/``append_rt``/
+    ``append_im``: a position whose key hasn't been seen before maps to
+    itself; a repeat maps to the earlier position holding the same key.
+    """
+
+    seen: dict = {}
+    first_occurrence = np.empty(len(key_tuples), dtype=np.intp)
+    for i, key in enumerate(key_tuples):
+        first_occurrence[i] = seen.setdefault(key, i)
+    return first_occurrence
+
+
+def _normalize_float_array(values: npt.ArrayLike, name: str) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if len(array) == 0:
+        return np.empty(0, dtype=np.float64)
+    if array.dtype.kind not in "iuf":
+        raise TypeError(f"{name} must contain numeric values")
+    with np.errstate(over="ignore", invalid="ignore"):
+        normalized = array.astype(np.float64, copy=False)
+    if not np.all(np.isfinite(normalized)):
+        raise ValueError(f"{name} must contain finite values")
+    return normalized
 
 
 def _normalize_collision_energy(values: npt.ArrayLike) -> np.ndarray:

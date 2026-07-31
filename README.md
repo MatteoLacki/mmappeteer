@@ -116,3 +116,31 @@ for intensities, annotation_ids in result.iter_arrays():
 Collision energy is normalized to `float32` before insertion and lookup.
 Existing cache keys are never replaced. Writers coordinate with the advisory
 `write.lock`; readers do not acquire it.
+
+Within-batch duplicate keys (the same key submitted twice in one `append_many`/
+`append_rt`/`append_im` call) are de-duplicated automatically -- the first
+occurrence is stored, and every submitted position (including later repeats)
+gets that entry's range/value back. A key that already exists from a
+*previous* call still raises `CacheKeyExistsError`; check `lookup*()` first to
+avoid that.
+
+## RT/IM scalar caches
+
+Retention-time and ion-mobility predictions are one scalar per key, so they
+skip the mmappet ragged-array machinery entirely -- plain SQLite tables in the
+same `index.sqlite3`, no ranges.
+
+```python
+cache.append_rt(sequence=["PEPTIDE", "OTHER"], retention_time=[12.5, 30.0])
+rt = cache.lookup_rt(sequence=["OTHER", "MISSING", "PEPTIDE"])
+# rt.values == [30.0, 0.0, 12.5]   (0.0 is a placeholder; check rt.found)
+# rt.found  == [True, False, True]
+
+cache.append_im(sequence=["PEPTIDE"], charge=[2], ion_mobility=[0.85])
+im = cache.lookup_im(sequence=["PEPTIDE", "OTHER"], charge=[2, 2])
+# im.found == [True, False]
+```
+
+Retention time is keyed by `sequence` alone; ion mobility by `(sequence,
+charge)`. Both return a `ScalarLookupResult` (`values`, `found`,
+`missing_positions`), the scalar counterpart to `LookupResult`.

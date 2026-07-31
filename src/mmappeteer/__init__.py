@@ -10,6 +10,7 @@ from .cache import (
     PackedPredictions,
     PredictionCache,
     PredictionKeys,
+    ScalarLookupResult,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "PackedPredictions",
     "PredictionCache",
     "PredictionKeys",
+    "ScalarLookupResult",
 ]

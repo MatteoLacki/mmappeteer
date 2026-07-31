@@ -44,7 +44,7 @@ def test_create_populates_numpy_metadata(cache):
     )
 
     with sqlite3.connect(cache.database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT value FROM metadata WHERE key = 'annotation_count'"
@@ -183,7 +183,7 @@ def test_existing_key_is_rejected_without_appending(cache):
     assert len(cache.lookup(make_keys([], [], [])).predicted_intensities) == 1
 
 
-def test_duplicate_batch_keys_are_rejected_before_append(cache):
+def test_duplicate_batch_keys_are_deduplicated(cache):
     keys = make_keys([2, 2], [20, 20], ["ONE", "ONE"])
     predictions = PackedPredictions.validate(
         predicted_intensities=np.asarray([0.2, 0.3]),
@@ -191,10 +191,107 @@ def test_duplicate_batch_keys_are_rejected_before_append(cache):
         offsets=np.asarray([0, 1, 2]),
     )
 
-    with pytest.raises(CacheKeyExistsError, match="duplicate"):
-        cache.append_many(keys, predictions)
+    result = cache.append_many(keys, predictions)
 
-    assert len(cache.lookup(make_keys([], [], [])).predicted_intensities) == 0
+    # Both submitted positions point at the same (first-occurrence) range.
+    np.testing.assert_array_equal(result.starts, [0, 0])
+    np.testing.assert_array_equal(result.ends, [1, 1])
+
+    with sqlite3.connect(cache.database_path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM cache_entries").fetchone()[0]
+    assert count == 1
+
+    lookup = cache.lookup(make_keys([2], [20], ["ONE"]))
+    np.testing.assert_array_equal(lookup.starts, [0])
+    np.testing.assert_array_equal(lookup.ends, [1])
+    assert lookup.found[0]
+
+
+def test_duplicate_of_already_cached_key_still_raises(cache):
+    keys = make_keys([2], [20], ["ONE"])
+    predictions = PackedPredictions.validate(
+        predicted_intensities=np.asarray([0.2]),
+        annotation_ids=np.asarray([0]),
+        offsets=np.asarray([0, 1]),
+    )
+    cache.append_many(keys, predictions)
+
+    repeat_keys = make_keys([2, 2], [20, 20], ["ONE", "ONE"])
+    repeat_predictions = PackedPredictions.validate(
+        predicted_intensities=np.asarray([0.2, 0.2]),
+        annotation_ids=np.asarray([0, 0]),
+        offsets=np.asarray([0, 1, 2]),
+    )
+    with pytest.raises(CacheKeyExistsError):
+        cache.append_many(repeat_keys, repeat_predictions)
+
+
+def test_append_rt_and_lookup_rt_are_aligned_with_submitted_keys(cache):
+    cache.append_rt(
+        sequence=["PEPTIDE", "OTHER"],
+        retention_time=[12.5, 30.0],
+    )
+
+    result = cache.lookup_rt(sequence=["OTHER", "MISSING", "PEPTIDE"])
+
+    np.testing.assert_array_equal(result.found, [True, False, True])
+    assert result.values[0] == pytest.approx(30.0)
+    assert result.values[2] == pytest.approx(12.5)
+    np.testing.assert_array_equal(result.missing_positions, [1])
+
+
+def test_append_rt_deduplicates_within_batch(cache):
+    cache.append_rt(sequence=["PEPTIDE", "PEPTIDE"], retention_time=[12.5, 12.5])
+
+    with sqlite3.connect(cache.database_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM rt_cache_entries"
+        ).fetchone()[0]
+    assert count == 1
+
+    result = cache.lookup_rt(sequence=["PEPTIDE"])
+    assert result.found[0]
+    assert result.values[0] == pytest.approx(12.5)
+
+
+def test_append_rt_rejects_already_cached_sequence(cache):
+    cache.append_rt(sequence=["PEPTIDE"], retention_time=[12.5])
+    with pytest.raises(CacheKeyExistsError):
+        cache.append_rt(sequence=["PEPTIDE"], retention_time=[12.5])
+
+
+def test_append_im_and_lookup_im_are_aligned_with_submitted_keys(cache):
+    cache.append_im(
+        sequence=["PEPTIDE", "PEPTIDE"],
+        charge=[2, 3],
+        ion_mobility=[0.85, 0.95],
+    )
+
+    result = cache.lookup_im(
+        sequence=["PEPTIDE", "PEPTIDE", "OTHER"], charge=[3, 2, 2]
+    )
+
+    np.testing.assert_array_equal(result.found, [True, True, False])
+    assert result.values[0] == pytest.approx(0.95)
+    assert result.values[1] == pytest.approx(0.85)
+
+
+def test_append_im_deduplicates_within_batch(cache):
+    cache.append_im(
+        sequence=["PEPTIDE", "PEPTIDE"], charge=[2, 2], ion_mobility=[0.85, 0.85]
+    )
+
+    with sqlite3.connect(cache.database_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM im_cache_entries"
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_append_im_rejects_already_cached_key(cache):
+    cache.append_im(sequence=["PEPTIDE"], charge=[2], ion_mobility=[0.85])
+    with pytest.raises(CacheKeyExistsError):
+        cache.append_im(sequence=["PEPTIDE"], charge=[2], ion_mobility=[0.9])
 
 
 @pytest.mark.parametrize(
