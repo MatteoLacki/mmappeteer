@@ -15,6 +15,14 @@ INTENSITY_COLUMN = "predicted_intensity"
 ANNOTATION_COLUMN = "annotation_id"
 MAX_ANNOTATIONS = np.iinfo(np.uint16).max + 1
 
+# Allowed on-disk dtypes for the two mmappet columns. Deliberately a small,
+# closed set rather than accepting arbitrary numpy dtypes -- narrower widths
+# exist for one concrete reason (a small, e.g. <=256-entry, annotation
+# vocabulary; a predictor whose native output is already float16) rather
+# than as a fully general knob.
+_ANNOTATION_ID_DTYPES = (np.uint8, np.uint16)
+_INTENSITY_DTYPES = (np.float16, np.float32)
+
 
 def _load_mmappet():
     """Import the storage backend only when cache storage is accessed."""
@@ -114,16 +122,26 @@ class PackedPredictions:
         predicted_intensities: npt.ArrayLike,
         annotation_ids: npt.ArrayLike,
         offsets: npt.ArrayLike,
+        intensity_dtype: npt.DTypeLike = np.float32,
+        annotation_id_dtype: npt.DTypeLike = np.uint16,
     ) -> PackedPredictions:
-        """Normalize arrays, validate packed invariants, and construct data."""
+        """Normalize arrays, validate packed invariants, and construct data.
 
-        intensities = np.asarray(predicted_intensities, dtype=np.float32)
+        ``intensity_dtype``/``annotation_id_dtype`` default to this class's
+        original fixed widths so every existing caller (that doesn't know
+        about a cache's configured dtypes) is unaffected; ``PredictionCache``
+        passes its own instance dtypes explicitly.
+        """
+
+        intensity_dtype = np.dtype(intensity_dtype)
+        annotation_id_dtype = np.dtype(annotation_id_dtype)
+        intensities = np.asarray(predicted_intensities, dtype=intensity_dtype)
         normalized_annotation_ids = _normalize_integer_array(
             annotation_ids,
             "annotation_ids",
             minimum=0,
-            maximum=np.iinfo(np.uint16).max,
-            dtype=np.uint16,
+            maximum=int(np.iinfo(annotation_id_dtype).max),
+            dtype=annotation_id_dtype,
         )
         normalized_offsets = _normalize_integer_array(
             offsets, "offsets", minimum=0, dtype=np.int64
@@ -236,6 +254,21 @@ class PredictionCache:
         if validate:
             self.validate()
 
+        # Read back this cache's own configured dtypes (chosen once, at
+        # `create()` time) so `append`/`append_many` normalize against
+        # whatever this instance was actually built with, not a fixed
+        # float32/uint16 default -- needed functionally, not just for the
+        # optional `validate()` check above, so this happens unconditionally.
+        with self._connect() as connection:
+            metadata = dict(
+                connection.execute(
+                    "SELECT key, value FROM metadata "
+                    "WHERE key IN ('intensity_dtype', 'annotation_id_dtype')"
+                )
+            )
+        self._intensity_dtype = np.dtype(metadata["intensity_dtype"])
+        self._annotation_id_dtype = np.dtype(metadata["annotation_id_dtype"])
+
     @classmethod
     def create(
         cls,
@@ -243,14 +276,40 @@ class PredictionCache:
         annotations: npt.ArrayLike,
         *,
         model_names: str | npt.ArrayLike,
+        annotation_id_dtype: npt.DTypeLike = np.uint16,
+        intensity_dtype: npt.DTypeLike = np.float32,
     ) -> PredictionCache:
-        """Create a cache for predictions produced by one or more models."""
+        """Create a cache for predictions produced by one or more models.
+
+        ``annotation_id_dtype``/``intensity_dtype`` default to this class's
+        original widths (`uint16`/`float32`) -- pass a narrower dtype (from
+        `_ANNOTATION_ID_DTYPES`/`_INTENSITY_DTYPES`) when the annotation
+        vocabulary is small and/or the source predictions are already
+        lower-precision, to avoid storing false precision/range. Fixed once
+        at creation time; every later `append`/`append_many`/`lookup` on
+        this instance uses whatever was chosen here (read back from
+        `metadata` in `__init__`).
+        """
 
         path = Path(path)
-        annotation_names = _validate_names(annotations, "annotations")
-        if len(annotation_names) > MAX_ANNOTATIONS:
+        annotation_id_dtype = np.dtype(annotation_id_dtype)
+        intensity_dtype = np.dtype(intensity_dtype)
+        if annotation_id_dtype.type not in _ANNOTATION_ID_DTYPES:
             raise ValueError(
-                f"At most {MAX_ANNOTATIONS} annotations fit in uint16 storage"
+                f"annotation_id_dtype must be one of {_ANNOTATION_ID_DTYPES}, "
+                f"got {annotation_id_dtype}"
+            )
+        if intensity_dtype.type not in _INTENSITY_DTYPES:
+            raise ValueError(
+                f"intensity_dtype must be one of {_INTENSITY_DTYPES}, "
+                f"got {intensity_dtype}"
+            )
+        max_annotations = int(np.iinfo(annotation_id_dtype).max) + 1
+        annotation_names = _validate_names(annotations, "annotations")
+        if len(annotation_names) > max_annotations:
+            raise ValueError(
+                f"At most {max_annotations} annotations fit in "
+                f"{annotation_id_dtype} storage"
             )
         normalized_model_names = _validate_names(
             [model_names] if isinstance(model_names, str) else model_names,
@@ -309,8 +368,8 @@ class PredictionCache:
                     ("schema_version", str(SCHEMA_VERSION)),
                     ("annotation_count", str(len(annotation_names))),
                     ("collision_energy_dtype", "float32"),
-                    ("intensity_dtype", "float32"),
-                    ("annotation_id_dtype", "uint16"),
+                    ("intensity_dtype", intensity_dtype.name),
+                    ("annotation_id_dtype", annotation_id_dtype.name),
                     (
                         "model_names",
                         json.dumps(
@@ -337,8 +396,8 @@ class PredictionCache:
         try:
             with _load_mmappet().DatasetWriter.new(
                 dataset_path,
-                predicted_intensity=np.float32,
-                annotation_id=np.uint16,
+                predicted_intensity=intensity_dtype,
+                annotation_id=annotation_id_dtype,
             ):
                 pass
         except Exception:
@@ -360,7 +419,7 @@ class PredictionCache:
                 """
             ).fetchall()
         return AnnotationVocabulary(
-            ids=np.fromiter((row[0] for row in rows), dtype=np.uint16),
+            ids=np.fromiter((row[0] for row in rows), dtype=self._annotation_id_dtype),
             names=np.asarray([row[1] for row in rows], dtype=object),
         )
 
@@ -394,7 +453,7 @@ class PredictionCache:
             Exclusive row offset of the appended vectors.
         """
 
-        intensities = np.asarray(predicted_intensities, dtype=np.float32)
+        n = len(np.asarray(predicted_intensities))
         result = self.append_many(
             PredictionKeys.validate(
                 charge=np.asarray([charge]),
@@ -402,9 +461,11 @@ class PredictionCache:
                 sequence=np.asarray([sequence]),
             ),
             PackedPredictions.validate(
-                predicted_intensities=intensities,
+                predicted_intensities=predicted_intensities,
                 annotation_ids=np.asarray(annotation_ids),
-                offsets=np.asarray([0, len(intensities)], dtype=np.int64),
+                offsets=np.asarray([0, n], dtype=np.int64),
+                intensity_dtype=self._intensity_dtype,
+                annotation_id_dtype=self._annotation_id_dtype,
             ),
         )
         return int(result.starts[0]), int(result.ends[0])
@@ -445,6 +506,8 @@ class PredictionCache:
             predicted_intensities=predictions.predicted_intensities,
             annotation_ids=predictions.annotation_ids,
             offsets=predictions.offsets,
+            intensity_dtype=self._intensity_dtype,
+            annotation_id_dtype=self._annotation_id_dtype,
         )
         if len(keys) != len(predictions):
             raise ValueError(
@@ -795,16 +858,6 @@ class PredictionCache:
     def validate(self) -> None:
         """Check schema versions, annotation numbering, and stored ranges."""
 
-        storage = _load_mmappet().open_dataset_dct(self.dataset_path)
-        if set(storage) != {INTENSITY_COLUMN, ANNOTATION_COLUMN}:
-            raise CacheValidationError(f"Unexpected mmappet columns: {list(storage)}")
-        if storage[INTENSITY_COLUMN].dtype != np.dtype(np.float32):
-            raise CacheValidationError("predicted_intensity must have dtype float32")
-        if storage[ANNOTATION_COLUMN].dtype != np.dtype(np.uint16):
-            raise CacheValidationError("annotation_id must have dtype uint16")
-        if len(storage[INTENSITY_COLUMN]) != len(storage[ANNOTATION_COLUMN]):
-            raise CacheValidationError("mmappet columns have unequal lengths")
-
         with self._connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
@@ -813,20 +866,55 @@ class PredictionCache:
                 )
 
             metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-            expected_metadata = {
-                "schema_version": str(SCHEMA_VERSION),
-                "collision_energy_dtype": "float32",
-                "intensity_dtype": "float32",
-                "annotation_id_dtype": "uint16",
-            }
-            for key, expected in expected_metadata.items():
-                if metadata.get(key) != expected:
-                    raise CacheValidationError(
-                        f"Invalid metadata {key!r}: {metadata.get(key)!r}"
-                    )
+            if metadata.get("schema_version") != str(SCHEMA_VERSION):
+                raise CacheValidationError(
+                    f"Invalid metadata 'schema_version': "
+                    f"{metadata.get('schema_version')!r}"
+                )
+            if metadata.get("collision_energy_dtype") != "float32":
+                raise CacheValidationError(
+                    "Invalid metadata 'collision_energy_dtype': "
+                    f"{metadata.get('collision_energy_dtype')!r}"
+                )
+            # Narrower `intensity_dtype`/`annotation_id_dtype` are allowed
+            # (see `_INTENSITY_DTYPES`/`_ANNOTATION_ID_DTYPES`) -- validated
+            # against that closed set, not a single fixed literal, then
+            # cross-checked against the mmappet storage's actual dtype below
+            # for self-consistency.
+            intensity_dtype_name = metadata.get("intensity_dtype")
+            annotation_id_dtype_name = metadata.get("annotation_id_dtype")
+            if intensity_dtype_name not in {d.__name__ for d in _INTENSITY_DTYPES}:
+                raise CacheValidationError(
+                    f"Invalid metadata 'intensity_dtype': {intensity_dtype_name!r}"
+                )
+            if annotation_id_dtype_name not in {
+                d.__name__ for d in _ANNOTATION_ID_DTYPES
+            }:
+                raise CacheValidationError(
+                    "Invalid metadata 'annotation_id_dtype': "
+                    f"{annotation_id_dtype_name!r}"
+                )
             if "model_names" not in metadata:
                 raise CacheValidationError("metadata is missing model_names")
             _decode_model_names(metadata["model_names"])
+
+            storage = _load_mmappet().open_dataset_dct(self.dataset_path)
+            if set(storage) != {INTENSITY_COLUMN, ANNOTATION_COLUMN}:
+                raise CacheValidationError(
+                    f"Unexpected mmappet columns: {list(storage)}"
+                )
+            if storage[INTENSITY_COLUMN].dtype != np.dtype(intensity_dtype_name):
+                raise CacheValidationError(
+                    f"predicted_intensity dtype {storage[INTENSITY_COLUMN].dtype} "
+                    f"does not match metadata {intensity_dtype_name!r}"
+                )
+            if storage[ANNOTATION_COLUMN].dtype != np.dtype(annotation_id_dtype_name):
+                raise CacheValidationError(
+                    f"annotation_id dtype {storage[ANNOTATION_COLUMN].dtype} "
+                    f"does not match metadata {annotation_id_dtype_name!r}"
+                )
+            if len(storage[INTENSITY_COLUMN]) != len(storage[ANNOTATION_COLUMN]):
+                raise CacheValidationError("mmappet columns have unequal lengths")
 
             existing_tables = {
                 row[0]

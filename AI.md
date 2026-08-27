@@ -5,9 +5,10 @@
 `mmappeteer` is an append-only prediction cache. SQLite indexes keys and
 half-open ranges; `mmappet` stores aligned, mmap-backed NumPy columns. The
 canonical key is `(charge, collision_energy, sequence)`. Each key maps to an
-intensity (`float32`) and annotation-ID (`uint16`) vector of equal length.
-Two scalar caches (retention time, ion mobility) share the same
-`index.sqlite3` but skip mmappet entirely -- see "Scalar caches" below.
+intensity and annotation-ID vector of equal length -- `float32`/`uint16` by
+default, or a narrower pair chosen at `create()` time (see "Configurable
+dtypes" below). Two scalar caches (retention time, ion mobility) share the
+same `index.sqlite3` but skip mmappet entirely -- see "Scalar caches" below.
 
 Start with `README.md`. Implementation is in `src/mmappeteer/cache.py`; tests
 are in `tests/test_cache.py`.
@@ -38,6 +39,28 @@ are in `tests/test_cache.py`.
   the scalar counterpart to `LookupResult`.
 - Same de-duplication and existing-key-raise rules as `append_many` (below)
   apply here too.
+
+## Configurable dtypes (2026-08-27)
+
+`PredictionCache.create()` accepts optional `annotation_id_dtype`
+(`np.uint8`/`np.uint16`, default `np.uint16`) and `intensity_dtype`
+(`np.float16`/`np.float32`, default `np.float32`) — a closed set, not
+arbitrary numpy dtypes, since narrower widths exist for one concrete reason
+(a small annotation vocabulary; a source predictor whose native output is
+already lower-precision) rather than as a fully general knob. Chosen once
+at `create()` time, recorded in `metadata`, and read back into
+`self._intensity_dtype`/`self._annotation_id_dtype` on every subsequent
+`PredictionCache(path)` open (unconditionally, not just under `validate=True`
+— `append`/`append_many` need these regardless of whether validation runs).
+`validate()` checks the *metadata* against this closed set (not a single
+hardcoded literal) and then cross-checks the mmappet storage's actual dtype
+against that metadata for self-consistency. Existing callers that never
+pass these params are unaffected — defaults are exactly the original
+`float32`/`uint16`, and `git/featureprediction`'s own RT/IIM cache and
+`sagepy-rescore`'s intensity cache both still get that on-disk shape
+unchanged. First real consumer of the narrower pair:
+`git/featureprediction/fragment_intensity.py`'s Prosit MS2 cache
+(`uint8`/`float16` — 174-entry vocabulary, FP16-native source model).
 
 ## Storage invariants
 

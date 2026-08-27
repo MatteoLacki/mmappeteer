@@ -375,6 +375,110 @@ def test_validation_detects_invalid_model_names(cache):
         PredictionCache(cache.path)
 
 
+def test_create_defaults_to_float32_and_uint16(cache):
+    assert cache._intensity_dtype == np.dtype(np.float32)
+    assert cache._annotation_id_dtype == np.dtype(np.uint16)
+
+
+def test_create_with_narrow_dtypes_round_trips(tmp_path):
+    narrow = PredictionCache.create(
+        tmp_path / "narrow_cache",
+        np.asarray([f"slot{i}" for i in range(174)]),
+        model_names=np.asarray(["Prosit_2024_intensity_PTMs_gl_compact_trt:HCD"]),
+        annotation_id_dtype=np.uint8,
+        intensity_dtype=np.float16,
+    )
+    assert narrow._intensity_dtype == np.dtype(np.float16)
+    assert narrow._annotation_id_dtype == np.dtype(np.uint8)
+
+    narrow.append(
+        charge=2,
+        collision_energy=30.0,
+        sequence="PEPTIDE",
+        predicted_intensities=[0.5, 0.9, 1.0],
+        annotation_ids=[0, 87, 173],
+    )
+
+    reopened = PredictionCache(narrow.path)
+    assert reopened._intensity_dtype == np.dtype(np.float16)
+    assert reopened._annotation_id_dtype == np.dtype(np.uint8)
+
+    lookup = reopened.lookup(make_keys([2], [30.0], ["PEPTIDE"]))
+    assert lookup.predicted_intensities.dtype == np.dtype(np.float16)
+    assert lookup.annotation_ids.dtype == np.dtype(np.uint8)
+    intensities, annotation_ids = next(lookup.iter_arrays())
+    np.testing.assert_array_equal(annotation_ids, [0, 87, 173])
+    np.testing.assert_allclose(intensities, [0.5, 0.9, 1.0], rtol=1e-3)
+
+
+def test_create_rejects_disallowed_annotation_id_dtype(tmp_path):
+    with pytest.raises(ValueError, match="annotation_id_dtype"):
+        PredictionCache.create(
+            tmp_path / "bad_cache",
+            np.asarray(["b1"]),
+            model_names="test",
+            annotation_id_dtype=np.int32,
+        )
+
+
+def test_create_rejects_disallowed_intensity_dtype(tmp_path):
+    with pytest.raises(ValueError, match="intensity_dtype"):
+        PredictionCache.create(
+            tmp_path / "bad_cache",
+            np.asarray(["b1"]),
+            model_names="test",
+            intensity_dtype=np.float64,
+        )
+
+
+def test_create_rejects_oversized_vocabulary_for_uint8(tmp_path):
+    with pytest.raises(ValueError, match="uint8"):
+        PredictionCache.create(
+            tmp_path / "bad_cache",
+            np.asarray([f"slot{i}" for i in range(300)]),
+            model_names="test",
+            annotation_id_dtype=np.uint8,
+        )
+
+
+def test_append_many_rejects_annotation_id_beyond_uint8_vocab(tmp_path):
+    narrow = PredictionCache.create(
+        tmp_path / "narrow_cache",
+        np.asarray([f"slot{i}" for i in range(174)]),
+        model_names="test",
+        annotation_id_dtype=np.uint8,
+        intensity_dtype=np.float16,
+    )
+    with pytest.raises(ValueError, match="annotation_ids"):
+        narrow.append(
+            charge=2,
+            collision_energy=30.0,
+            sequence="PEPTIDE",
+            predicted_intensities=[0.1],
+            annotation_ids=[174],
+        )
+
+
+def test_validation_detects_intensity_dtype_metadata_mismatch(cache):
+    with sqlite3.connect(cache.database_path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = 'float16' WHERE key = 'intensity_dtype'"
+        )
+
+    with pytest.raises(CacheValidationError, match="predicted_intensity dtype"):
+        PredictionCache(cache.path)
+
+
+def test_validation_detects_invalid_annotation_id_dtype_metadata(cache):
+    with sqlite3.connect(cache.database_path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = 'uint32' WHERE key = 'annotation_id_dtype'"
+        )
+
+    with pytest.raises(CacheValidationError, match="annotation_id_dtype"):
+        PredictionCache(cache.path)
+
+
 def test_importing_mmappeteer_does_not_import_pandas():
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.fspath((Path(__file__).parents[1] / "src").resolve())
