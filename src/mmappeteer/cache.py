@@ -671,13 +671,35 @@ class PredictionCache:
                 with self._connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     if len(sequences):
-                        placeholders = ",".join("?" * len(sequences))
-                        existing = connection.execute(
-                            f"""
-                            SELECT sequence FROM rt_cache_entries
-                            WHERE sequence IN ({placeholders})
+                        # Temp-table + JOIN, not a per-row `IN (?,?,...)`
+                        # placeholder list -- the latter hits SQLite's bound
+                        # variable limit (a few thousand sequences and more
+                        # already fails; a real bulk fill has millions).
+                        # Mirrors append_many's own `_prepare_requested_keys`
+                        # pattern (that path never had this bug because it
+                        # already used a temp table).
+                        connection.execute(
+                            "DROP TABLE IF EXISTS temp.append_rt_check_keys"
+                        )
+                        connection.execute(
+                            """
+                            CREATE TEMP TABLE append_rt_check_keys (
+                                sequence TEXT PRIMARY KEY
+                            ) STRICT
+                            """
+                        )
+                        connection.executemany(
+                            """
+                            INSERT OR IGNORE INTO append_rt_check_keys(sequence)
+                            VALUES (?)
                             """,
-                            [str(s) for s in sequences],
+                            ((str(s),) for s in sequences),
+                        )
+                        existing = connection.execute(
+                            """
+                            SELECT sequence FROM append_rt_check_keys
+                            JOIN rt_cache_entries USING (sequence)
+                            """
                         ).fetchall()
                         if existing:
                             raise CacheKeyExistsError(
@@ -776,17 +798,35 @@ class PredictionCache:
                 with self._connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     if len(sequences):
-                        pairs = ",".join("(?, ?)" for _ in sequences)
-                        existing = connection.execute(
-                            f"""
-                            SELECT sequence, charge FROM im_cache_entries
-                            WHERE (sequence, charge) IN ({pairs})
+                        # Same fix as append_rt -- temp-table + JOIN instead
+                        # of a per-row `(sequence, charge) IN ((?,?),...)`
+                        # placeholder list, which hits SQLite's bound
+                        # variable limit even faster here (two placeholders
+                        # per row).
+                        connection.execute(
+                            "DROP TABLE IF EXISTS temp.append_im_check_keys"
+                        )
+                        connection.execute(
+                            """
+                            CREATE TEMP TABLE append_im_check_keys (
+                                sequence TEXT NOT NULL,
+                                charge   INTEGER NOT NULL,
+                                PRIMARY KEY (sequence, charge)
+                            ) STRICT
+                            """
+                        )
+                        connection.executemany(
+                            """
+                            INSERT OR IGNORE INTO append_im_check_keys(sequence, charge)
+                            VALUES (?, ?)
                             """,
-                            [
-                                value
-                                for seq, ch in zip(sequences, charges)
-                                for value in (str(seq), int(ch))
-                            ],
+                            ((str(s), int(c)) for s, c in zip(sequences, charges)),
+                        )
+                        existing = connection.execute(
+                            """
+                            SELECT sequence, charge FROM append_im_check_keys
+                            JOIN im_cache_entries USING (sequence, charge)
+                            """
                         ).fetchall()
                         if existing:
                             raise CacheKeyExistsError(

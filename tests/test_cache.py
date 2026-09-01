@@ -294,6 +294,42 @@ def test_append_im_rejects_already_cached_key(cache):
         cache.append_im(sequence=["PEPTIDE"], charge=[2], ion_mobility=[0.9])
 
 
+def test_append_rt_handles_bulk_batch_past_sqlite_variable_limit(cache):
+    """Regression test: the existing-key check used to build a raw
+    `WHERE sequence IN (?,?,...)` clause with one bound parameter per row,
+    which raises `sqlite3.OperationalError: too many SQL variables` well
+    before this many rows (SQLite's compiled limit is a few hundred to a
+    few thousand, depending on build). Found via a real first-ever bulk
+    fill of 6.3M sequences; 50,000 here is already an order of magnitude
+    past the smallest real-world limit (999) without making the test slow.
+    """
+    n = 50_000
+    sequences = [f"PEPTIDE{i}" for i in range(n)]
+    retention_times = list(np.arange(n, dtype=np.float64))
+
+    cache.append_rt(sequence=sequences, retention_time=retention_times)
+
+    result = cache.lookup_rt(sequence=sequences)
+    assert result.found.all()
+    np.testing.assert_array_equal(result.values, retention_times)
+
+
+def test_append_im_handles_bulk_batch_past_sqlite_variable_limit(cache):
+    """Same regression as test_append_rt_handles_bulk_batch_past_sqlite_variable_limit
+    -- append_im's existing-key check used two bound parameters per row
+    (sequence, charge), hitting the limit even sooner."""
+    n = 50_000
+    sequences = [f"PEPTIDE{i}" for i in range(n)]
+    charges = [2] * n
+    mobilities = list(np.linspace(0.7, 1.3, n))
+
+    cache.append_im(sequence=sequences, charge=charges, ion_mobility=mobilities)
+
+    result = cache.lookup_im(sequence=sequences, charge=charges)
+    assert result.found.all()
+    np.testing.assert_allclose(result.values, mobilities)
+
+
 @pytest.mark.parametrize(
     "charge",
     [np.asarray([0]), np.asarray([-1]), np.asarray([1.5]), np.asarray([True])],
