@@ -103,6 +103,24 @@ The strict SQLite table has a composite primary key, which is also the lookup
 index. If persisted schema semantics change, increment `SCHEMA_VERSION` and
 add migration or explicit compatibility behavior and tests.
 
+## Bulk `append_rt`/`append_im` at real scale (2026-09-01)
+
+Never build a raw `WHERE key IN (?,?,?,...)` clause with one bound SQL
+parameter per submitted row -- SQLite's compiled variable limit (a few
+hundred to a few thousand, build-dependent) is far below real bulk-fill
+sizes (millions of sequences). `append_rt`/`append_im`'s existing-key
+duplicate check used exactly this pattern and crashed
+(`sqlite3.OperationalError: too many SQL variables`) the first time either
+was ever exercised at real scale -- `append_many`/`lookup_rt` already used
+the correct temp-table-then-`JOIN` pattern (insert rows one-at-a-time via
+`executemany`, no per-execution row-count-scaled parameter list), so
+`append_rt`/`append_im` were brought in line with that, not a new pattern.
+If you add another bulk key-membership check anywhere in this file, use the
+temp-table pattern from the start -- it was never validated against
+millions of rows here at design time, only caught by a real downstream
+consumer (`git/featureprediction`'s RT/IIM prediction caching, wired for
+the first time this session) actually filling the cache at scale.
+
 ## Development
 
 The neighboring mmappet checkout is configured at `../../mmappet`.
