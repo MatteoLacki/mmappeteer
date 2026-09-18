@@ -1,10 +1,11 @@
 import os
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from mmappeteer import (
@@ -14,6 +15,25 @@ from mmappeteer import (
     PredictionCache,
     PredictionKeys,
 )
+
+
+def read_metadata(cache):
+    table = pq.read_table(cache.metadata_path).to_pydict()
+    return dict(zip(table["key"], table["value"]))
+
+
+def set_metadata(cache, key, value):
+    table = pq.read_table(cache.metadata_path).to_pydict()
+    table["value"] = [
+        value if name == key else old
+        for name, old in zip(table["key"], table["value"])
+    ]
+    pq.write_table(pa.table(table), cache.metadata_path)
+
+
+def count_entries(directory):
+    return sum(pq.read_metadata(shard).num_rows for shard in directory.glob("*.parquet"))
+
 
 
 def make_keys(charge, collision_energy, sequence):
@@ -43,17 +63,10 @@ def test_create_populates_numpy_metadata(cache):
         ["Prosit_2020_intensity_HCD", "local-finetune-v2"],
     )
 
-    with sqlite3.connect(cache.database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
-        assert (
-            connection.execute(
-                "SELECT value FROM metadata WHERE key = 'annotation_count'"
-            ).fetchone()[0]
-            == "4"
-        )
-        assert connection.execute(
-            "SELECT value FROM metadata WHERE key = 'model_names'"
-        ).fetchone()[0] == ('["Prosit_2020_intensity_HCD","local-finetune-v2"]')
+    metadata = read_metadata(cache)
+    assert metadata["schema_version"] == "4"
+    assert metadata["annotation_count"] == "4"
+    assert metadata["model_names"] == '["Prosit_2020_intensity_HCD","local-finetune-v2"]'
 
 
 @pytest.mark.parametrize(
@@ -197,9 +210,7 @@ def test_duplicate_batch_keys_are_deduplicated(cache):
     np.testing.assert_array_equal(result.starts, [0, 0])
     np.testing.assert_array_equal(result.ends, [1, 1])
 
-    with sqlite3.connect(cache.database_path) as connection:
-        count = connection.execute("SELECT COUNT(*) FROM cache_entries").fetchone()[0]
-    assert count == 1
+    assert count_entries(cache.entries_path) == 1
 
     lookup = cache.lookup(make_keys([2], [20], ["ONE"]))
     np.testing.assert_array_equal(lookup.starts, [0])
@@ -243,11 +254,7 @@ def test_append_rt_and_lookup_rt_are_aligned_with_submitted_keys(cache):
 def test_append_rt_deduplicates_within_batch(cache):
     cache.append_rt(sequence=["PEPTIDE", "PEPTIDE"], retention_time=[12.5, 12.5])
 
-    with sqlite3.connect(cache.database_path) as connection:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM rt_cache_entries"
-        ).fetchone()[0]
-    assert count == 1
+    assert count_entries(cache.rt_entries_path) == 1
 
     result = cache.lookup_rt(sequence=["PEPTIDE"])
     assert result.found[0]
@@ -281,11 +288,7 @@ def test_append_im_deduplicates_within_batch(cache):
         sequence=["PEPTIDE", "PEPTIDE"], charge=[2, 2], ion_mobility=[0.85, 0.85]
     )
 
-    with sqlite3.connect(cache.database_path) as connection:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM im_cache_entries"
-        ).fetchone()[0]
-    assert count == 1
+    assert count_entries(cache.im_entries_path) == 1
 
 
 def test_append_im_rejects_already_cached_key(cache):
@@ -392,20 +395,14 @@ def test_empty_batch_is_supported(cache):
 
 
 def test_validation_detects_bad_annotation_count(cache):
-    with sqlite3.connect(cache.database_path) as connection:
-        connection.execute(
-            "UPDATE metadata SET value = '174' WHERE key = 'annotation_count'"
-        )
+    set_metadata(cache, "annotation_count", "174")
 
     with pytest.raises(CacheValidationError, match="annotation_count"):
         PredictionCache(cache.path)
 
 
 def test_validation_detects_invalid_model_names(cache):
-    with sqlite3.connect(cache.database_path) as connection:
-        connection.execute(
-            "UPDATE metadata SET value = 'not-json' WHERE key = 'model_names'"
-        )
+    set_metadata(cache, "model_names", "not-json")
 
     with pytest.raises(CacheValidationError, match="model_names"):
         PredictionCache(cache.path)
@@ -496,20 +493,14 @@ def test_append_many_rejects_annotation_id_beyond_uint8_vocab(tmp_path):
 
 
 def test_validation_detects_intensity_dtype_metadata_mismatch(cache):
-    with sqlite3.connect(cache.database_path) as connection:
-        connection.execute(
-            "UPDATE metadata SET value = 'float16' WHERE key = 'intensity_dtype'"
-        )
+    set_metadata(cache, "intensity_dtype", "float16")
 
     with pytest.raises(CacheValidationError, match="predicted_intensity dtype"):
         PredictionCache(cache.path)
 
 
 def test_validation_detects_invalid_annotation_id_dtype_metadata(cache):
-    with sqlite3.connect(cache.database_path) as connection:
-        connection.execute(
-            "UPDATE metadata SET value = 'uint32' WHERE key = 'annotation_id_dtype'"
-        )
+    set_metadata(cache, "annotation_id_dtype", "uint32")
 
     with pytest.raises(CacheValidationError, match="annotation_id_dtype"):
         PredictionCache(cache.path)

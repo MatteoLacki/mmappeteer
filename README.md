@@ -4,7 +4,7 @@
 
 `mmappeteer` is an append-only NumPy prediction cache built from two pieces:
 
-- SQLite stores searchable keys and half-open array ranges.
+- Parquet shards store searchable keys and half-open array ranges.
 - `mmappet` stores growing, mmap-backed NumPy columns.
 
 The canonical cache maps `(charge, collision_energy, sequence)` to two aligned
@@ -127,8 +127,8 @@ avoid that.
 ## RT/IM scalar caches
 
 Retention-time and ion-mobility predictions are one scalar per key, so they
-skip the mmappet ragged-array machinery entirely -- plain SQLite tables in the
-same `index.sqlite3`, no ranges.
+skip the mmappet ragged-array machinery entirely -- their own parquet index
+directories (`rt_entries/`, `im_entries/`), no ranges.
 
 ```python
 cache.append_rt(sequence=["PEPTIDE", "OTHER"], retention_time=[12.5, 30.0])

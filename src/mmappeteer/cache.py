@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fcntl
 import json
-import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 INTENSITY_COLUMN = "predicted_intensity"
 ANNOTATION_COLUMN = "annotation_id"
 MAX_ANNOTATIONS = np.iinfo(np.uint16).max + 1
@@ -32,6 +31,22 @@ def _load_mmappet():
     return mmappet
 
 
+def _load_duckdb():
+    """Import the query engine only when the index is read or written."""
+
+    import duckdb
+
+    return duckdb
+
+
+def _load_pyarrow():
+    """Import Arrow only when index shards are written or keys registered."""
+
+    import pyarrow
+
+    return pyarrow
+
+
 class CacheError(RuntimeError):
     """Base class for cache-specific failures."""
 
@@ -41,7 +56,7 @@ class CacheKeyExistsError(CacheError):
 
 
 class CacheValidationError(CacheError):
-    """Raised when the SQLite index and mmappet storage disagree."""
+    """Raised when the parquet index and mmappet storage disagree."""
 
 
 @dataclass(frozen=True)
@@ -237,20 +252,29 @@ class LookupResult:
 class PredictionCache:
     """Append-only cache keyed by charge, collision energy, and sequence."""
 
-    database_filename = "index.sqlite3"
+    metadata_filename = "metadata.parquet"
+    annotations_filename = "annotations.parquet"
+    entries_dirname = "entries"
+    rt_entries_dirname = "rt_entries"
+    im_entries_dirname = "im_entries"
     dataset_filename = "arrays.mmappet"
     lock_filename = "write.lock"
 
     def __init__(self, path: str | Path, *, validate: bool = True):
         self.path = Path(path)
-        self.database_path = self.path / self.database_filename
+        self.metadata_path = self.path / self.metadata_filename
+        self.annotations_path = self.path / self.annotations_filename
+        self.entries_path = self.path / self.entries_dirname
+        self.rt_entries_path = self.path / self.rt_entries_dirname
+        self.im_entries_path = self.path / self.im_entries_dirname
         self.dataset_path = self.path / self.dataset_filename
         self.lock_path = self.path / self.lock_filename
 
-        if not self.database_path.is_file():
-            raise FileNotFoundError(f"Cache database not found: {self.database_path}")
+        if not self.metadata_path.is_file():
+            raise FileNotFoundError(f"Cache metadata not found: {self.metadata_path}")
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Cache dataset not found: {self.dataset_path}")
+        self._connection = None
         if validate:
             self.validate()
 
@@ -259,15 +283,18 @@ class PredictionCache:
         # whatever this instance was actually built with, not a fixed
         # float32/uint16 default -- needed functionally, not just for the
         # optional `validate()` check above, so this happens unconditionally.
-        with self._connect() as connection:
-            metadata = dict(
-                connection.execute(
-                    "SELECT key, value FROM metadata "
-                    "WHERE key IN ('intensity_dtype', 'annotation_id_dtype')"
-                )
-            )
+        metadata = self._metadata()
         self._intensity_dtype = np.dtype(metadata["intensity_dtype"])
         self._annotation_id_dtype = np.dtype(metadata["annotation_id_dtype"])
+
+    @classmethod
+    def exists(cls, path: str | Path) -> bool:
+        """Whether `path` holds a cache this class can open."""
+
+        path = Path(path)
+        return (path / cls.metadata_filename).is_file() and (
+            path / cls.dataset_filename
+        ).is_dir()
 
     @classmethod
     def create(
@@ -315,83 +342,61 @@ class PredictionCache:
             [model_names] if isinstance(model_names, str) else model_names,
             "model_names",
         )
-        database_path = path / cls.database_filename
         dataset_path = path / cls.dataset_filename
+        metadata_path = path / cls.metadata_filename
 
         path.mkdir(parents=True, exist_ok=True)
-        if database_path.exists() or dataset_path.exists():
+        if metadata_path.exists() or dataset_path.exists():
             raise FileExistsError(f"Refusing to overwrite an existing cache at {path}")
 
-        connection = sqlite3.connect(database_path)
         try:
-            connection.executescript(
-                """
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = FULL;
-
-                CREATE TABLE metadata (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                ) STRICT, WITHOUT ROWID;
-
-                CREATE TABLE annotations (
-                    annotation_id INTEGER PRIMARY KEY CHECK (annotation_id >= 0),
-                    annotation    TEXT NOT NULL UNIQUE
-                ) STRICT;
-
-                CREATE TABLE cache_entries (
-                    charge           INTEGER NOT NULL CHECK (charge >= 1),
-                    collision_energy REAL NOT NULL,
-                    sequence         TEXT NOT NULL,
-                    start            INTEGER NOT NULL CHECK (start >= 0),
-                    end              INTEGER NOT NULL CHECK (end >= start),
-                    PRIMARY KEY (charge, collision_energy, sequence)
-                ) STRICT, WITHOUT ROWID;
-
-                CREATE TABLE rt_cache_entries (
-                    sequence       TEXT NOT NULL,
-                    retention_time REAL NOT NULL,
-                    PRIMARY KEY (sequence)
-                ) STRICT, WITHOUT ROWID;
-
-                CREATE TABLE im_cache_entries (
-                    sequence     TEXT NOT NULL,
-                    charge       INTEGER NOT NULL CHECK (charge >= 1),
-                    ion_mobility REAL NOT NULL,
-                    PRIMARY KEY (sequence, charge)
-                ) STRICT, WITHOUT ROWID;
-                """
-            )
-            connection.executemany(
-                "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                (
-                    ("schema_version", str(SCHEMA_VERSION)),
-                    ("annotation_count", str(len(annotation_names))),
-                    ("collision_energy_dtype", "float32"),
-                    ("intensity_dtype", intensity_dtype.name),
-                    ("annotation_id_dtype", annotation_id_dtype.name),
-                    (
-                        "model_names",
-                        json.dumps(
-                            normalized_model_names.tolist(),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
+            _write_table(
+                metadata_path,
+                {
+                    "key": np.array(
+                        [
+                            "schema_version",
+                            "annotation_count",
+                            "collision_energy_dtype",
+                            "intensity_dtype",
+                            "annotation_id_dtype",
+                            "model_names",
+                        ],
+                        dtype=object,
                     ),
-                ),
+                    "value": np.array(
+                        [
+                            str(SCHEMA_VERSION),
+                            str(len(annotation_names)),
+                            "float32",
+                            intensity_dtype.name,
+                            annotation_id_dtype.name,
+                            json.dumps(
+                                normalized_model_names.tolist(),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        ],
+                        dtype=object,
+                    ),
+                },
             )
-            connection.executemany(
-                "INSERT INTO annotations(annotation_id, annotation) VALUES (?, ?)",
-                enumerate(annotation_names.tolist()),
+            _write_table(
+                path / cls.annotations_filename,
+                {
+                    "annotation_id": np.arange(len(annotation_names), dtype=np.int64),
+                    "annotation": annotation_names,
+                },
             )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            connection.commit()
+            for dirname in (
+                cls.entries_dirname,
+                cls.rt_entries_dirname,
+                cls.im_entries_dirname,
+            ):
+                (path / dirname).mkdir(exist_ok=True)
         except Exception:
-            connection.close()
-            database_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
             raise
-        finally:
-            connection.close()
 
         try:
             with _load_mmappet().DatasetWriter.new(
@@ -401,7 +406,7 @@ class PredictionCache:
             ):
                 pass
         except Exception:
-            database_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
             raise
 
         (path / cls.lock_filename).touch(exist_ok=True)
@@ -410,14 +415,15 @@ class PredictionCache:
     def annotations(self) -> AnnotationVocabulary:
         """Return the complete annotation vocabulary as NumPy arrays."""
 
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT annotation_id, annotation
-                FROM annotations
-                ORDER BY annotation_id
-                """
-            ).fetchall()
+        rows = (
+            self._connect()
+            .execute(
+                "SELECT annotation_id, annotation FROM read_parquet(?) "
+                "ORDER BY annotation_id",
+                [str(self.annotations_path)],
+            )
+            .fetchall()
+        )
         return AnnotationVocabulary(
             ids=np.fromiter((row[0] for row in rows), dtype=self._annotation_id_dtype),
             names=np.asarray([row[1] for row in rows], dtype=object),
@@ -426,13 +432,10 @@ class PredictionCache:
     def model_names(self) -> npt.NDArray[np.object_]:
         """Return model provenance as a one-dimensional string array."""
 
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'model_names'"
-            ).fetchone()
-        if row is None:
+        value = self._metadata().get("model_names")
+        if value is None:
             raise CacheValidationError("metadata is missing model_names")
-        return _decode_model_names(row[0])
+        return _decode_model_names(value)
 
     def append(
         self,
@@ -514,10 +517,7 @@ class PredictionCache:
                 f"keys has {len(keys)} entries but predictions has {len(predictions)}"
             )
 
-        with self._connect() as connection:
-            annotation_count = connection.execute(
-                "SELECT COUNT(*) FROM annotations"
-            ).fetchone()[0]
+        annotation_count = int(self._metadata()["annotation_count"])
         if len(predictions.annotation_ids) and np.any(
             predictions.annotation_ids >= annotation_count
         ):
@@ -540,61 +540,45 @@ class PredictionCache:
         with self.lock_path.open("rb") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
-                with self._connect() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    _prepare_requested_keys(connection, keys)
-
-                    existing = connection.execute(
-                        """
-                        SELECT requested_keys.request_position
-                        FROM requested_keys
-                        JOIN cache_entries USING (
-                            charge, collision_energy, sequence
-                        )
-                        ORDER BY requested_keys.request_position
-                        """
-                    ).fetchall()
-                    if existing:
-                        positions = [row[0] for row in existing]
-                        raise CacheKeyExistsError(
-                            "Cache keys already exist at submitted positions "
-                            f"{positions}"
-                        )
-
-                    if len(keys):
-                        with _load_mmappet().DatasetWriter(
-                            self.dataset_path, append_ok=True
-                        ) as writer:
-                            storage_start = len(writer)
-                            writer.append(
-                                predicted_intensity=(predictions.predicted_intensities),
-                                annotation_id=predictions.annotation_ids,
-                            )
-                            writer.flush()
-                    else:
-                        storage_start = self._storage_length()
-
-                    ranges = storage_start + predictions.offsets
-                    starts = ranges[:-1].astype(np.int64, copy=False)
-                    ends = ranges[1:].astype(np.int64, copy=False)
-                    connection.executemany(
-                        """
-                        INSERT INTO cache_entries(
-                            charge, collision_energy, sequence, start, end
-                        ) VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            (
-                                int(keys.charge[i]),
-                                float(keys.collision_energy[i]),
-                                str(keys.sequence[i]),
-                                int(starts[i]),
-                                int(ends[i]),
-                            )
-                            for i in first_indices
-                        ),
+                existing = self._matching_entries(keys, columns="1")
+                if existing is not None:
+                    positions = np.sort(existing["request_position"]).tolist()
+                    raise CacheKeyExistsError(
+                        "Cache keys already exist at submitted positions "
+                        f"{positions}"
                     )
-                    connection.commit()
+
+                if len(keys):
+                    with _load_mmappet().DatasetWriter(
+                        self.dataset_path, append_ok=True
+                    ) as writer:
+                        storage_start = len(writer)
+                        writer.append(
+                            predicted_intensity=(predictions.predicted_intensities),
+                            annotation_id=predictions.annotation_ids,
+                        )
+                        writer.flush()
+                else:
+                    storage_start = self._storage_length()
+
+                ranges = storage_start + predictions.offsets
+                starts = ranges[:-1].astype(np.int64, copy=False)
+                ends = ranges[1:].astype(np.int64, copy=False)
+                # The shard lands after the mmappet append: a crash in between
+                # leaves unreferenced storage rows, never an index entry
+                # pointing at rows that were never written.
+                _append_shard(
+                    self.entries_path,
+                    {
+                        "charge": keys.charge[first_indices],
+                        "collision_energy": keys.collision_energy[
+                            first_indices
+                        ].astype(np.float64),
+                        "sequence": keys.sequence[first_indices],
+                        "start": starts[first_indices],
+                        "end": ends[first_indices],
+                    },
+                )
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
@@ -615,17 +599,15 @@ class PredictionCache:
             collision_energy=keys.collision_energy,
             sequence=keys.sequence,
         )
-        with self._connect() as connection:
-            rows = _lookup_rows(connection, keys)
-
         starts = np.full(len(keys), -1, dtype=np.int64)
         ends = np.full(len(keys), -1, dtype=np.int64)
         found = np.zeros(len(keys), dtype=bool)
-        for position, start, end in rows:
-            if start is not None and end is not None:
-                starts[position] = start
-                ends[position] = end
-                found[position] = True
+        matches = self._matching_entries(keys, columns='e.start AS start, e."end" AS "end"')
+        if matches is not None:
+            positions = matches["request_position"]
+            starts[positions] = matches["start"]
+            ends[positions] = matches["end"]
+            found[positions] = True
 
         storage = _load_mmappet().open_dataset_dct(self.dataset_path)
         return LookupResult(
@@ -668,55 +650,23 @@ class PredictionCache:
         with self.lock_path.open("rb") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
-                with self._connect() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    if len(sequences):
-                        # Temp-table + JOIN, not a per-row `IN (?,?,...)`
-                        # placeholder list -- the latter hits SQLite's bound
-                        # variable limit (a few thousand sequences and more
-                        # already fails; a real bulk fill has millions).
-                        # Mirrors append_many's own `_prepare_requested_keys`
-                        # pattern (that path never had this bug because it
-                        # already used a temp table).
-                        connection.execute(
-                            "DROP TABLE IF EXISTS temp.append_rt_check_keys"
-                        )
-                        connection.execute(
-                            """
-                            CREATE TEMP TABLE append_rt_check_keys (
-                                sequence TEXT PRIMARY KEY
-                            ) STRICT
-                            """
-                        )
-                        connection.executemany(
-                            """
-                            INSERT OR IGNORE INTO append_rt_check_keys(sequence)
-                            VALUES (?)
-                            """,
-                            ((str(s),) for s in sequences),
-                        )
-                        existing = connection.execute(
-                            """
-                            SELECT sequence FROM append_rt_check_keys
-                            JOIN rt_cache_entries USING (sequence)
-                            """
-                        ).fetchall()
-                        if existing:
-                            raise CacheKeyExistsError(
-                                "Retention-time cache keys already exist: "
-                                f"{sorted(row[0] for row in existing)}"
-                            )
-                    connection.executemany(
-                        """
-                        INSERT INTO rt_cache_entries(sequence, retention_time)
-                        VALUES (?, ?)
-                        """,
-                        (
-                            (str(sequences[i]), float(values[i]))
-                            for i in first_indices
-                        ),
+                existing = self._matching_scalar_entries(
+                    self.rt_entries_path,
+                    {"sequence": sequences},
+                    columns="e.sequence AS sequence",
+                )
+                if existing is not None:
+                    raise CacheKeyExistsError(
+                        "Retention-time cache keys already exist: "
+                        f"{sorted(str(value) for value in existing['sequence'])}"
                     )
-                    connection.commit()
+                _append_shard(
+                    self.rt_entries_path,
+                    {
+                        "sequence": sequences[first_indices],
+                        "retention_time": values[first_indices],
+                    },
+                )
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
@@ -726,37 +676,15 @@ class PredictionCache:
         sequences = _normalize_string_array(sequence, "sequence")
         values = np.zeros(len(sequences), dtype=np.float64)
         found = np.zeros(len(sequences), dtype=bool)
-        if len(sequences):
-            with self._connect() as connection:
-                connection.execute("DROP TABLE IF EXISTS temp.requested_rt_keys")
-                connection.execute(
-                    """
-                    CREATE TEMP TABLE requested_rt_keys (
-                        request_position INTEGER PRIMARY KEY,
-                        sequence         TEXT NOT NULL
-                    ) STRICT
-                    """
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO requested_rt_keys(request_position, sequence)
-                    VALUES (?, ?)
-                    """,
-                    enumerate(map(str, sequences)),
-                )
-                rows = connection.execute(
-                    """
-                    SELECT requested_rt_keys.request_position,
-                           rt_cache_entries.retention_time
-                    FROM requested_rt_keys
-                    LEFT JOIN rt_cache_entries USING (sequence)
-                    ORDER BY requested_rt_keys.request_position
-                    """
-                ).fetchall()
-            for position, retention_time in rows:
-                if retention_time is not None:
-                    values[position] = retention_time
-                    found[position] = True
+        matches = self._matching_scalar_entries(
+            self.rt_entries_path,
+            {"sequence": sequences},
+            columns="e.retention_time AS value",
+        )
+        if matches is not None:
+            positions = matches["request_position"]
+            values[positions] = matches["value"]
+            found[positions] = True
         return ScalarLookupResult(values=values, found=found)
 
     def append_im(
@@ -795,55 +723,24 @@ class PredictionCache:
         with self.lock_path.open("rb") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
-                with self._connect() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    if len(sequences):
-                        # Same fix as append_rt -- temp-table + JOIN instead
-                        # of a per-row `(sequence, charge) IN ((?,?),...)`
-                        # placeholder list, which hits SQLite's bound
-                        # variable limit even faster here (two placeholders
-                        # per row).
-                        connection.execute(
-                            "DROP TABLE IF EXISTS temp.append_im_check_keys"
-                        )
-                        connection.execute(
-                            """
-                            CREATE TEMP TABLE append_im_check_keys (
-                                sequence TEXT NOT NULL,
-                                charge   INTEGER NOT NULL,
-                                PRIMARY KEY (sequence, charge)
-                            ) STRICT
-                            """
-                        )
-                        connection.executemany(
-                            """
-                            INSERT OR IGNORE INTO append_im_check_keys(sequence, charge)
-                            VALUES (?, ?)
-                            """,
-                            ((str(s), int(c)) for s, c in zip(sequences, charges)),
-                        )
-                        existing = connection.execute(
-                            """
-                            SELECT sequence, charge FROM append_im_check_keys
-                            JOIN im_cache_entries USING (sequence, charge)
-                            """
-                        ).fetchall()
-                        if existing:
-                            raise CacheKeyExistsError(
-                                "Ion-mobility cache keys already exist: "
-                                f"{sorted(existing)}"
-                            )
-                    connection.executemany(
-                        """
-                        INSERT INTO im_cache_entries(sequence, charge, ion_mobility)
-                        VALUES (?, ?, ?)
-                        """,
-                        (
-                            (str(sequences[i]), int(charges[i]), float(values[i]))
-                            for i in first_indices
-                        ),
+                existing = self._matching_scalar_entries(
+                    self.im_entries_path,
+                    {"sequence": sequences, "charge": charges},
+                    columns='e.sequence AS sequence, e.charge AS charge',
+                )
+                if existing is not None:
+                    raise CacheKeyExistsError(
+                        "Ion-mobility cache keys already exist: "
+                        f"{sorted(zip(map(str, existing['sequence']), map(int, existing['charge'])))}"
                     )
-                    connection.commit()
+                _append_shard(
+                    self.im_entries_path,
+                    {
+                        "sequence": sequences[first_indices],
+                        "charge": charges[first_indices],
+                        "ion_mobility": values[first_indices],
+                    },
+                )
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
@@ -861,178 +758,256 @@ class PredictionCache:
             )
         values = np.zeros(len(sequences), dtype=np.float64)
         found = np.zeros(len(sequences), dtype=bool)
-        if len(sequences):
-            with self._connect() as connection:
-                connection.execute("DROP TABLE IF EXISTS temp.requested_im_keys")
-                connection.execute(
-                    """
-                    CREATE TEMP TABLE requested_im_keys (
-                        request_position INTEGER PRIMARY KEY,
-                        sequence         TEXT NOT NULL,
-                        charge           INTEGER NOT NULL
-                    ) STRICT
-                    """
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO requested_im_keys(request_position, sequence, charge)
-                    VALUES (?, ?, ?)
-                    """,
-                    zip(range(len(sequences)), map(str, sequences), map(int, charges)),
-                )
-                rows = connection.execute(
-                    """
-                    SELECT requested_im_keys.request_position,
-                           im_cache_entries.ion_mobility
-                    FROM requested_im_keys
-                    LEFT JOIN im_cache_entries USING (sequence, charge)
-                    ORDER BY requested_im_keys.request_position
-                    """
-                ).fetchall()
-            for position, ion_mobility in rows:
-                if ion_mobility is not None:
-                    values[position] = ion_mobility
-                    found[position] = True
+        matches = self._matching_scalar_entries(
+            self.im_entries_path,
+            {"sequence": sequences, "charge": charges},
+            columns="e.ion_mobility AS value",
+        )
+        if matches is not None:
+            positions = matches["request_position"]
+            values[positions] = matches["value"]
+            found[positions] = True
         return ScalarLookupResult(values=values, found=found)
 
     def validate(self) -> None:
         """Check schema versions, annotation numbering, and stored ranges."""
 
-        with self._connect() as connection:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version != SCHEMA_VERSION:
-                raise CacheValidationError(
-                    f"Unsupported schema version {version}; expected {SCHEMA_VERSION}"
-                )
-
-            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-            if metadata.get("schema_version") != str(SCHEMA_VERSION):
-                raise CacheValidationError(
-                    f"Invalid metadata 'schema_version': "
-                    f"{metadata.get('schema_version')!r}"
-                )
-            if metadata.get("collision_energy_dtype") != "float32":
-                raise CacheValidationError(
-                    "Invalid metadata 'collision_energy_dtype': "
-                    f"{metadata.get('collision_energy_dtype')!r}"
-                )
-            # Narrower `intensity_dtype`/`annotation_id_dtype` are allowed
-            # (see `_INTENSITY_DTYPES`/`_ANNOTATION_ID_DTYPES`) -- validated
-            # against that closed set, not a single fixed literal, then
-            # cross-checked against the mmappet storage's actual dtype below
-            # for self-consistency.
-            intensity_dtype_name = metadata.get("intensity_dtype")
-            annotation_id_dtype_name = metadata.get("annotation_id_dtype")
-            if intensity_dtype_name not in {d.__name__ for d in _INTENSITY_DTYPES}:
-                raise CacheValidationError(
-                    f"Invalid metadata 'intensity_dtype': {intensity_dtype_name!r}"
-                )
-            if annotation_id_dtype_name not in {
-                d.__name__ for d in _ANNOTATION_ID_DTYPES
-            }:
-                raise CacheValidationError(
-                    "Invalid metadata 'annotation_id_dtype': "
-                    f"{annotation_id_dtype_name!r}"
-                )
-            if "model_names" not in metadata:
-                raise CacheValidationError("metadata is missing model_names")
-            _decode_model_names(metadata["model_names"])
-
-            storage = _load_mmappet().open_dataset_dct(self.dataset_path)
-            if set(storage) != {INTENSITY_COLUMN, ANNOTATION_COLUMN}:
-                raise CacheValidationError(
-                    f"Unexpected mmappet columns: {list(storage)}"
-                )
-            if storage[INTENSITY_COLUMN].dtype != np.dtype(intensity_dtype_name):
-                raise CacheValidationError(
-                    f"predicted_intensity dtype {storage[INTENSITY_COLUMN].dtype} "
-                    f"does not match metadata {intensity_dtype_name!r}"
-                )
-            if storage[ANNOTATION_COLUMN].dtype != np.dtype(annotation_id_dtype_name):
-                raise CacheValidationError(
-                    f"annotation_id dtype {storage[ANNOTATION_COLUMN].dtype} "
-                    f"does not match metadata {annotation_id_dtype_name!r}"
-                )
-            if len(storage[INTENSITY_COLUMN]) != len(storage[ANNOTATION_COLUMN]):
-                raise CacheValidationError("mmappet columns have unequal lengths")
-
-            existing_tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
-            }
-            missing_tables = (
-                {"cache_entries", "rt_cache_entries", "im_cache_entries"}
-                - existing_tables
+        metadata = self._metadata()
+        if metadata.get("schema_version") != str(SCHEMA_VERSION):
+            raise CacheValidationError(
+                f"Invalid metadata 'schema_version': "
+                f"{metadata.get('schema_version')!r}"
             )
-            if missing_tables:
-                raise CacheValidationError(
-                    f"Missing required tables: {sorted(missing_tables)}"
-                )
-
-            annotation_ids = np.fromiter(
-                (
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT annotation_id FROM annotations ORDER BY annotation_id"
-                    )
-                ),
-                dtype=np.int64,
+        if metadata.get("collision_energy_dtype") != "float32":
+            raise CacheValidationError(
+                "Invalid metadata 'collision_energy_dtype': "
+                f"{metadata.get('collision_energy_dtype')!r}"
             )
-            if not np.array_equal(
-                annotation_ids, np.arange(len(annotation_ids), dtype=np.int64)
-            ):
-                raise CacheValidationError(
-                    "annotations.annotation_id values must be contiguous from zero"
-                )
-            if metadata.get("annotation_count") != str(len(annotation_ids)):
-                raise CacheValidationError(
-                    "metadata annotation_count does not match annotations table"
-                )
+        # Narrower `intensity_dtype`/`annotation_id_dtype` are allowed
+        # (see `_INTENSITY_DTYPES`/`_ANNOTATION_ID_DTYPES`) -- validated
+        # against that closed set, not a single fixed literal, then
+        # cross-checked against the mmappet storage's actual dtype below
+        # for self-consistency.
+        intensity_dtype_name = metadata.get("intensity_dtype")
+        annotation_id_dtype_name = metadata.get("annotation_id_dtype")
+        if intensity_dtype_name not in {d.__name__ for d in _INTENSITY_DTYPES}:
+            raise CacheValidationError(
+                f"Invalid metadata 'intensity_dtype': {intensity_dtype_name!r}"
+            )
+        if annotation_id_dtype_name not in {d.__name__ for d in _ANNOTATION_ID_DTYPES}:
+            raise CacheValidationError(
+                "Invalid metadata 'annotation_id_dtype': "
+                f"{annotation_id_dtype_name!r}"
+            )
+        if "model_names" not in metadata:
+            raise CacheValidationError("metadata is missing model_names")
+        _decode_model_names(metadata["model_names"])
 
-            bad_range = connection.execute(
+        storage = _load_mmappet().open_dataset_dct(self.dataset_path)
+        if set(storage) != {INTENSITY_COLUMN, ANNOTATION_COLUMN}:
+            raise CacheValidationError(f"Unexpected mmappet columns: {list(storage)}")
+        if storage[INTENSITY_COLUMN].dtype != np.dtype(intensity_dtype_name):
+            raise CacheValidationError(
+                f"predicted_intensity dtype {storage[INTENSITY_COLUMN].dtype} "
+                f"does not match metadata {intensity_dtype_name!r}"
+            )
+        if storage[ANNOTATION_COLUMN].dtype != np.dtype(annotation_id_dtype_name):
+            raise CacheValidationError(
+                f"annotation_id dtype {storage[ANNOTATION_COLUMN].dtype} "
+                f"does not match metadata {annotation_id_dtype_name!r}"
+            )
+        if len(storage[INTENSITY_COLUMN]) != len(storage[ANNOTATION_COLUMN]):
+            raise CacheValidationError("mmappet columns have unequal lengths")
+
+        missing_directories = sorted(
+            path.name
+            for path in (self.entries_path, self.rt_entries_path, self.im_entries_path)
+            if not path.is_dir()
+        )
+        if missing_directories:
+            raise CacheValidationError(
+                f"Missing required directories: {missing_directories}"
+            )
+        if not self.annotations_path.is_file():
+            raise CacheValidationError(
+                f"Missing annotations table: {self.annotations_path}"
+            )
+
+        annotation_ids = np.asarray(
+            self._connect()
+            .execute(
+                "SELECT annotation_id FROM read_parquet(?) ORDER BY annotation_id",
+                [str(self.annotations_path)],
+            )
+            .fetchnumpy()["annotation_id"],
+            dtype=np.int64,
+        )
+        if not np.array_equal(
+            annotation_ids, np.arange(len(annotation_ids), dtype=np.int64)
+        ):
+            raise CacheValidationError(
+                "annotations.annotation_id values must be contiguous from zero"
+            )
+        if metadata.get("annotation_count") != str(len(annotation_ids)):
+            raise CacheValidationError(
+                "metadata annotation_count does not match annotations table"
+            )
+
+        shards = self._shards(self.entries_path)
+        if not shards:
+            return
+        bad_range = (
+            self._connect()
+            .execute(
                 """
-                SELECT charge, collision_energy, sequence, start, end
-                FROM cache_entries
-                WHERE end > ?
+                SELECT charge, collision_energy, sequence, start, "end"
+                FROM read_parquet(?)
+                WHERE "end" > ?
                 LIMIT 1
                 """,
-                (len(storage[INTENSITY_COLUMN]),),
-            ).fetchone()
-            if bad_range is not None:
-                raise CacheValidationError(
-                    f"Cache entry points outside mmappet storage: {bad_range}"
-                )
+                [shards, len(storage[INTENSITY_COLUMN])],
+            )
+            .fetchone()
+        )
+        if bad_range is not None:
+            raise CacheValidationError(
+                f"Cache entry points outside mmappet storage: {bad_range}"
+            )
 
-            overlap = connection.execute(
+        overlap = (
+            self._connect()
+            .execute(
                 """
                 WITH ordered AS (
-                    SELECT start, end,
-                           MAX(end) OVER (
-                               ORDER BY start, end
+                    SELECT start, "end",
+                           MAX("end") OVER (
+                               ORDER BY start, "end"
                                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
                            ) AS previous_max_end
-                    FROM cache_entries
+                    FROM read_parquet(?)
                 )
-                SELECT start, end, previous_max_end
+                SELECT start, "end", previous_max_end
                 FROM ordered
                 WHERE start < previous_max_end
                 LIMIT 1
-                """
-            ).fetchone()
-            if overlap is not None:
-                raise CacheValidationError(f"Overlapping cache ranges found: {overlap}")
+                """,
+                [shards],
+            )
+            .fetchone()
+        )
+        if overlap is not None:
+            raise CacheValidationError(f"Overlapping cache ranges found: {overlap}")
+
+    def compact(self) -> None:
+        """Merge each index directory's shards into a single parquet file.
+
+        Purely a read-performance measure -- shard count only ever costs
+        per-file open/footer parsing, never correctness.
+        """
+
+        self.lock_path.touch(exist_ok=True)
+        with self.lock_path.open("rb") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                for directory in (
+                    self.entries_path,
+                    self.rt_entries_path,
+                    self.im_entries_path,
+                ):
+                    shards = self._shards(directory)
+                    if len(shards) < 2:
+                        continue
+                    merged = directory / "compacting.parquet"
+                    # The destination cannot be a bound parameter: DuckDB
+                    # binds a COPY's TO placeholder before the query's own.
+                    self._connect().execute(
+                        "COPY (SELECT * FROM read_parquet(?)) "
+                        f"TO {_sql_string(merged)} (FORMAT PARQUET)",
+                        [shards],
+                    )
+                    for shard in shards:
+                        Path(shard).unlink()
+                    merged.rename(directory / _shard_filename(0))
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def _storage_length(self) -> int:
         return len(
             _load_mmappet().open_dataset_dct(self.dataset_path)[INTENSITY_COLUMN]
         )
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    def _connect(self):
+        """One in-process DuckDB connection per cache instance."""
+
+        if self._connection is None:
+            self._connection = _load_duckdb().connect()
+        return self._connection
+
+    def _metadata(self) -> dict[str, str]:
+        rows = (
+            self._connect()
+            .execute(
+                "SELECT key, value FROM read_parquet(?)", [str(self.metadata_path)]
+            )
+            .fetchall()
+        )
+        return {str(key): str(value) for key, value in rows}
+
+    @staticmethod
+    def _shards(directory: Path) -> list[str]:
+        return sorted(str(path) for path in directory.glob("*.parquet"))
+
+    def _matching_entries(self, keys: PredictionKeys, *, columns: str):
+        """Join `keys` against the intensity index; None when nothing matches."""
+
+        return self._matching_scalar_entries(
+            self.entries_path,
+            {
+                "charge": keys.charge,
+                "collision_energy": keys.collision_energy.astype(np.float64),
+                "sequence": keys.sequence,
+            },
+            columns=columns,
+        )
+
+    def _matching_scalar_entries(
+        self, directory: Path, key_columns: dict[str, np.ndarray], *, columns: str
+    ):
+        """Inner-join requested keys against one index directory.
+
+        Returns the matched rows as NumPy arrays (always including
+        `request_position`), or None when there is nothing to match -- no
+        requested keys, no shards, or no hits.
+        """
+
+        n_requested = len(next(iter(key_columns.values())))
+        shards = self._shards(directory)
+        if n_requested == 0 or not shards:
+            return None
+        pa = _load_pyarrow()
+        requested = pa.table(
+            {
+                "request_position": np.arange(n_requested, dtype=np.int64),
+                **{name: _arrow_column(values) for name, values in key_columns.items()},
+            }
+        )
+        using = ", ".join(key_columns)
+        connection = self._connect()
+        connection.register("requested_keys", requested)
+        try:
+            matches = connection.execute(
+                f"""
+                SELECT r.request_position AS request_position, {columns}
+                FROM requested_keys r
+                JOIN read_parquet(?) e USING ({using})
+                """,
+                [shards],
+            ).fetchnumpy()
+        finally:
+            connection.unregister("requested_keys")
+        if len(matches["request_position"]) == 0:
+            return None
+        return matches
 
 
 def _normalize_integer_array(
@@ -1147,46 +1122,44 @@ def _decode_model_names(value: str) -> np.ndarray:
         raise CacheValidationError(f"Invalid metadata model_names: {error}") from error
 
 
-def _prepare_requested_keys(
-    connection: sqlite3.Connection, keys: PredictionKeys
-) -> None:
-    connection.execute("DROP TABLE IF EXISTS temp.requested_keys")
-    connection.execute(
-        """
-        CREATE TEMP TABLE requested_keys (
-            request_position INTEGER PRIMARY KEY,
-            charge           INTEGER NOT NULL,
-            collision_energy REAL NOT NULL,
-            sequence         TEXT NOT NULL
-        ) STRICT
-        """
-    )
-    connection.executemany(
-        """
-        INSERT INTO requested_keys(
-            request_position, charge, collision_energy, sequence
-        ) VALUES (?, ?, ?, ?)
-        """,
-        zip(
-            range(len(keys)),
-            map(int, keys.charge),
-            map(float, keys.collision_energy),
-            map(str, keys.sequence),
-        ),
+def _sql_string(value) -> str:
+    """Quote `value` as a SQL string literal."""
+
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _shard_filename(index: int) -> str:
+    return f"{index:08d}.parquet"
+
+
+def _arrow_column(values: np.ndarray):
+    """Arrow-ready view of one key column (object arrays become strings)."""
+
+    if values.dtype == object:
+        return _load_pyarrow().array(values.tolist(), type=_load_pyarrow().string())
+    return values
+
+
+def _write_table(path: Path, columns: dict[str, np.ndarray]) -> None:
+    pa = _load_pyarrow()
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table({name: _arrow_column(values) for name, values in columns.items()}),
+        path,
     )
 
 
-def _lookup_rows(
-    connection: sqlite3.Connection, keys: PredictionKeys
-) -> list[tuple[int, int | None, int | None]]:
-    _prepare_requested_keys(connection, keys)
-    return connection.execute(
-        """
-        SELECT requested_keys.request_position,
-               cache_entries.start,
-               cache_entries.end
-        FROM requested_keys
-        LEFT JOIN cache_entries USING (charge, collision_energy, sequence)
-        ORDER BY requested_keys.request_position
-        """
-    ).fetchall()
+def _append_shard(directory: Path, columns: dict[str, np.ndarray]) -> None:
+    """Write one new parquet shard; never touches the existing ones.
+
+    Callers hold the cache's write lock, so picking the next free number by
+    looking at the directory cannot race another writer.
+    """
+
+    directory.mkdir(parents=True, exist_ok=True)
+    existing = sorted(directory.glob("*.parquet"))
+    next_index = 0
+    if existing:
+        next_index = int(existing[-1].stem) + 1
+    _write_table(directory / _shard_filename(next_index), columns)
