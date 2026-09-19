@@ -1074,7 +1074,13 @@ def _normalize_collision_energy(values: npt.ArrayLike) -> np.ndarray:
 
 
 def _normalize_string_array(values: npt.ArrayLike, name: str) -> np.ndarray:
-    array = np.asarray(values)
+    # A list goes straight to an object array holding the same str objects.
+    # Plain `np.asarray` would first build a fixed-width unicode array sized
+    # to the longest string -- 4.56 GB for F9477's 6.3M peptides at <U181.
+    if isinstance(values, np.ndarray):
+        array = values
+    else:
+        array = np.asarray(values, dtype=object)
     if array.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional")
     if len(array) == 0:
