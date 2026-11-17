@@ -1,5 +1,9 @@
 # mmappeteer AI Guidance
 
+History lives in `AI_CHANGELOG.md` (append-only; read it for *why* something changed).
+This file is present tense: a change rewrites its sentence here and appends an entry
+there, in the same commit.
+
 ## Purpose
 
 `mmappeteer` is an append-only prediction cache. Parquet shards index keys
@@ -40,7 +44,7 @@ are in `tests/test_cache.py`.
 - Same de-duplication and existing-key-raise rules as `append_many` (below)
   apply here too.
 
-## Configurable dtypes (2026-08-27)
+## Configurable dtypes
 
 `PredictionCache.create()` accepts optional `annotation_id_dtype`
 (`np.uint8`/`np.uint16`, default `np.uint16`) and `intensity_dtype`
@@ -54,11 +58,7 @@ at `create()` time, recorded in `metadata`, and read back into
 — `append`/`append_many` need these regardless of whether validation runs).
 `validate()` checks the *metadata* against this closed set (not a single
 hardcoded literal) and then cross-checks the mmappet storage's actual dtype
-against that metadata for self-consistency. Existing callers that never
-pass these params are unaffected — defaults are exactly the original
-`float32`/`uint16`, and `git/featureprediction`'s own RT/IIM cache and
-`sagepy-rescore`'s intensity cache both still get that on-disk shape
-unchanged. First real consumer of the narrower pair:
+against that metadata for self-consistency. The narrower pair is used by
 `git/featureprediction/fragment_intensity.py`'s Prosit MS2 cache
 (`uint8`/`float16` — 174-entry vocabulary, FP16-native source model).
 
@@ -97,7 +97,7 @@ The index and mmappet do not share an atomic transaction. Preserve this order:
 A failed append can leave unreferenced tail data. Never make metadata visible
 before its array bytes.
 
-## On-disk layout (schema 4, 2026-09-18)
+## On-disk layout (schema 4)
 
 ```
 <cache>/
@@ -117,13 +117,9 @@ in-process DuckDB connection per cache instance (`_matching_scalar_entries`).
 `compact()` merges a directory's shards into one file; shard count only ever
 costs per-file open/footer parsing, never correctness.
 
-Why not SQLite (which schema 3 used): its row-oriented B-tree, read through
-DuckDB's `sqlite` scanner one row at a time, took **7.35s** to hand over the
-F9477 fragment index's 16.87M rows, against **0.53s** for the join itself.
-Columnar shards cut the warm F9477 export 13.4s -> 4.4s and the fill's
-missing-key anti-join to 3.0s, and the index shrank 800MB -> 390MB. Key type
-was never the problem: joining on a 64-bit hash instead of the sequence
-string saved 0.2s and produced 18 false matches from hash collisions.
+Not SQLite: DuckDB's `sqlite` scanner reads its B-tree one row at a time, 7.35 s for
+F9477's 16.87M index rows against 0.53 s for the join. Not a 64-bit key hash either:
+it saved 0.2 s and gave 18 false matches.
 
 Convert a schema-3 cache with `python -m mmappeteer.migrate <cache>`; it reads
 the old `index.sqlite3` through DuckDB, writes the parquet tables, leaves both
@@ -142,11 +138,9 @@ migration or explicit compatibility behavior and tests.
 ## Bulk key-membership checks at real scale
 
 Never build a `WHERE key IN (?,?,?,...)` clause with one bound parameter per
-submitted row. Schema 3 did this in `append_rt`/`append_im` and crashed on
-SQLite's compiled variable limit (`too many SQL variables`) the first time
-either ran at real scale -- millions of sequences. The parquet index has no
-such limit, but the shape of the fix is the one to keep: register the
-requested keys as one Arrow table and `JOIN`, never a parameter per row.
+submitted row: at millions of sequences it hits engine limits (SQLite's
+`too many SQL variables`). Register the requested keys as one Arrow table and
+`JOIN`.
 
 
 ## Development
